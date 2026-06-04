@@ -1,15 +1,37 @@
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::mpsc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+use std::time::Duration;
 
 use iced::widget::{button, column, container, row, text, Column};
 use iced::{Border, Color, Element, Length, Subscription, Task};
+use iced::{stream, window};
+use iced::futures::SinkExt;
 
 use crate::config::Config;
 use crate::manifest::Manifest;
 use crate::proton_setup;
 use crate::theme;
 use crate::tools;
+use crate::tray;
 use crate::ui;
+
+/// Wrapper so the tray receiver can be used as a `Subscription` identity
+/// (it must be `Hash`, which `Mutex` is not).
+struct TrayListener(Arc<Mutex<Option<mpsc::Receiver<tray::TrayMessage>>>>);
+
+impl std::hash::Hash for TrayListener {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Fixed identity — there's only one tray listener at a time
+        0usize.hash(state);
+    }
+}
+
+impl Clone for TrayListener {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 pub fn run() -> iced::Result {
     iced::application(
@@ -18,6 +40,10 @@ pub fn run() -> iced::Result {
         view,
     )
     .subscription(subscription)
+    .window(iced::window::Settings {
+        exit_on_close_request: false,
+        ..Default::default()
+    })
     .run()
 }
 
@@ -37,6 +63,15 @@ pub struct State {
     setup_active: bool,
     setup_progress: Vec<tools::ToolSetupResult>,
     setup_cancelled: Arc<AtomicBool>,
+
+    // Game launch tracking
+    game_launched: bool,
+
+    // Tray icon communication
+    tray_rx: Arc<Mutex<Option<mpsc::Receiver<tray::TrayMessage>>>>,
+
+    // Main window ID (set on first window open event)
+    main_window_id: Option<window::Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +96,14 @@ pub enum Message {
     LogToggle,
     LogDismiss,
     SetupDone(Vec<tools::ToolSetupResult>),
+    LaunchBypass,
+    // Tray / window events
+    CloseRequested,
+    TrayShowRequested,
+    TrayLaunchGame,
+    TrayLaunchAll,
+    TrayQuitRequested,
+    WindowOpened(window::Id),
 }
 
 impl State {
@@ -74,6 +117,10 @@ impl State {
             Manifest::fetch()
                 .map_err(|e| e.to_string())
         });
+
+        // Tray icon — runs on a background thread via D-Bus (SNI)
+        let tray_rx_raw = tray::spawn();
+        let tray_rx = Arc::new(Mutex::new(Some(tray_rx_raw)));
 
         (
             State {
@@ -90,6 +137,12 @@ impl State {
                 setup_active: false,
                 setup_progress: Vec::new(),
                 setup_cancelled: Arc::new(AtomicBool::new(false)),
+
+                game_launched: false,
+
+                tray_rx,
+
+                main_window_id: None,
             },
             Task::batch([
                 Task::perform(config_future, |res| {
@@ -178,8 +231,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     ,
                 |result| match result {
                     Ok(Ok(path)) => Message::ProtonDownloadDone(Ok(path)),
-                    Ok(Err(e)) => Message::ProtonDownloadDone(Err(e)),
-                    Err(e) => Message::ProtonDownloadDone(Err(format!("Task failed: {e}"))),
+                    Ok(Err(e)) => {
+                        eprintln!("Proton download task error: {e}");
+                        Message::ProtonDownloadDone(Err(e))
+                    }
+                    Err(e) => {
+                        eprintln!("Proton download task join error: {e}");
+                        Message::ProtonDownloadDone(Err(format!("Task failed: {e}")))
+                    }
                 },
             )
         }
@@ -207,6 +266,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
                 Err(e) => {
+                    eprintln!("Proton download failed: {e}");
                     state.log_messages.push(format!("Proton download failed: {e}"));
                     state.log_visible = true;
                 }
@@ -259,6 +319,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Verify the chosen path
             match proton_setup::verify_proton_installation(&path) {
                 Ok(()) => {
+                    state.proton_setup_active = false;
                     state.proton_path = Some(path.clone());
                     state.config.proton.path = Some(path.to_string_lossy().to_string());
                     let _ = state.config.save();
@@ -370,6 +431,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let manifest = state.manifest.clone();
             let config = state.config.clone();
             let game_prefix_path = state.game_prefix_path.clone();
+            let proton_path = state.config.proton.path.clone();
+            
+            state.game_launched = true;
             
             Task::perform(
                 async move {
@@ -413,7 +477,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
                             // Step 3: Launch tools with detected Proton path
                             let tool_refs: Vec<_> = tool_paths.iter().map(|p| p.as_path()).collect();
-                            let tool_results = crate::launch::launch_tools(&tool_refs, &game_prefix, &game_proton, &config.proton.path);
+                            let tool_results = crate::launch::launch_tools(&tool_refs, &game_prefix, &game_proton, &proton_path);
 
                             // Log tool launch results
                             for (name, result) in &tool_results {
@@ -426,6 +490,88 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             // Build success message
                             let mut messages = Vec::new();
                             messages.push("Sekiro launched successfully".to_string());
+                            for (name, result) in &tool_results {
+                                match result {
+                                    Ok(()) => messages.push(format!("✓ Tool '{}' launched", name)),
+                                    Err(e) => messages.push(format!("✗ Tool '{}' failed: {}", name, e)),
+                                }
+                            }
+                            Ok(messages.join("\n"))
+                    } else {
+                        Err("Missing manifest or game prefix configuration".to_string())
+                    }
+                },
+               |result| {
+                    match result {
+                        Ok(msg) => Message::LogPush(msg),
+                        Err(e) => Message::LogPush(format!("Launch error: {e}")),
+                    }
+                },
+            )
+        }
+        Message::LaunchBypass => {
+            let manifest = state.manifest.clone();
+            let config = state.config.clone();
+            let game_prefix_path = state.game_prefix_path.clone();
+            let proton_path = state.config.proton.path.clone();
+            
+            state.game_launched = true;
+            
+            Task::perform(
+                async move {
+                    if let (Some(manifest), Some(game_prefix)) = (manifest, game_prefix_path) {
+                            // Find all selected tools that are installed
+                            let selected_tools: Vec<_> = manifest.tools.iter().filter(|t| {
+                                let selected = config.tools.selected.contains(&t.slug);
+                                let installed = tools::is_installed(t, &game_prefix);
+                                if selected {
+                                    log::info!("LaunchBypass: tool '{}' selected={}, installed={}", t.name, selected, installed);
+                                }
+                                selected && installed
+                            }).collect();
+                            
+                            log::info!("LaunchBypass: {} tool(s) will be launched alongside Sekiro", selected_tools.len());
+                            
+                            // Build full paths to tool binaries by finding executables
+                            let tool_paths: Vec<_> = selected_tools.iter().filter_map(|t| {
+                                let tool_dir = tools::tool_install_dir(t, &game_prefix);
+                                if let Some(rel_exe) = tools::find_executable(&tool_dir) {
+                                    let tool_path = tool_dir.join(&rel_exe);
+                                    if tool_path.exists() {
+                                        log::info!("LaunchBypass: found tool '{}' at '{}'", t.name, tool_path.display());
+                                        return Some(tool_path);
+                                    }
+                                }
+                                log::warn!("LaunchBypass: tool '{}' executable not found in '{}'", t.name, tool_dir.display());
+                                None
+                            }).collect();
+
+                            // Step 1: Launch Sekiro via Proton bypass (no waitforexitandrun)
+                            if let Err(e) = crate::launch::launch_sekiro_bypass(&game_prefix, &proton_path) {
+                                return Err(format!("Failed to launch Sekiro: {}", e));
+                            }
+
+                            // Step 2: Wait for game to appear
+                            let game_info = crate::launch::wait_for_game().await;
+
+                            // Extract detected proton path from game process
+                            let game_proton = game_info.as_ref().and_then(|g| g.proton_path.clone());
+
+                            // Step 3: Launch tools, skipping any that are already running
+                            let tool_refs: Vec<_> = tool_paths.iter().map(|p| p.as_path()).collect();
+                            let tool_results = crate::launch::launch_tools(&tool_refs, &game_prefix, &game_proton, &proton_path);
+
+                            // Log tool launch results
+                            for (name, result) in &tool_results {
+                                match result {
+                                    Ok(()) => log::info!("LaunchBypass: tool '{}' started successfully", name),
+                                    Err(e) => log::error!("LaunchBypass: failed to start tool '{}': {}", name, e),
+                                }
+                            }
+
+                            // Build success message
+                            let mut messages = Vec::new();
+                            messages.push("Sekiro launched (bypass mode)".to_string());
                             for (name, result) in &tool_results {
                                 match result {
                                     Ok(()) => messages.push(format!("✓ Tool '{}' launched", name)),
@@ -490,6 +636,119 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.log_visible = true;
             Task::none()
         }
+        Message::WindowOpened(id) => {
+            state.main_window_id = Some(id);
+            log::info!("Window opened: {id}");
+            Task::none()
+        }
+        Message::CloseRequested => {
+            // Hide to tray instead of closing
+            log::info!("Close requested — hiding to tray");
+            if let Some(id) = state.main_window_id {
+                window::set_mode(id, window::Mode::Hidden)
+            } else {
+                Task::none()
+            }
+        }
+        Message::TrayShowRequested => {
+            // Restore window from tray
+            log::info!("Tray: show launcher requested");
+            if let Some(id) = state.main_window_id {
+                window::set_mode(id, window::Mode::Windowed)
+            } else {
+                Task::none()
+            }
+        }
+        Message::TrayLaunchGame => {
+            // Launch just Sekiro (no tools) — mirrors Launch button logic
+            state.game_launched = true;
+
+            let game_prefix = state.game_prefix_path.clone();
+            let proton_path = state.config.proton.path.clone();
+
+            Task::perform(
+                async move {
+                    match game_prefix {
+                        Some(prefix) => {
+                            // proton_path is &Option<String> — pass it directly
+                            crate::launch::launch_sekiro_bypass(&prefix, &proton_path)
+                                .map_err(|e| format!("Failed to launch Sekiro: {e}"))
+                        }
+                        None => {
+                            // Fallback: launch via Steam
+                            crate::launch::launch_sekiro()
+                                .map_err(|e| format!("Failed to launch Sekiro: {e}"))
+                        }
+                    }
+                },
+                |result| match result {
+                    Ok(()) => Message::LogPush("Game launched from tray.".into()),
+                    Err(e) => Message::LogPush(format!("Tray launch error: {e}")),
+                },
+            )
+        }
+        Message::TrayLaunchAll => {
+            // Same launch flow as the Launch button (game + tools)
+            let manifest = state.manifest.clone();
+            let config = state.config.clone();
+            let game_prefix_path = state.game_prefix_path.clone();
+            let proton_path = state.config.proton.path.clone();
+
+            state.game_launched = true;
+
+            Task::perform(
+                async move {
+                    if let (Some(manifest), Some(game_prefix)) = (manifest, game_prefix_path) {
+                        let selected_tools: Vec<_> = manifest.tools.iter().filter(|t| {
+                            let selected = config.tools.selected.contains(&t.slug);
+                            let installed = tools::is_installed(t, &game_prefix);
+                            selected && installed
+                        }).collect();
+
+                        let tool_paths: Vec<_> = selected_tools.iter().filter_map(|t| {
+                            let tool_dir = tools::tool_install_dir(t, &game_prefix);
+                            let rel_exe = tools::find_executable(&tool_dir)?;
+                            let tool_path = tool_dir.join(&rel_exe);
+                            if tool_path.exists() { Some(tool_path) } else { None }
+                        }).collect();
+
+                        if let Err(e) = crate::launch::launch_sekiro() {
+                            return Err(format!("Failed to launch Sekiro: {e}"));
+                        }
+
+                        let game_info = crate::launch::wait_for_game().await;
+                        let game_proton = game_info.as_ref().and_then(|g| g.proton_path.clone());
+
+                        let tool_refs: Vec<_> = tool_paths.iter().map(|p| p.as_path()).collect();
+                        let tool_results = crate::launch::launch_tools(&tool_refs, &game_prefix, &game_proton, &proton_path);
+
+                        let mut msgs = vec!["Sekiro launched from tray".to_string()];
+                        for (name, result) in &tool_results {
+                            match result {
+                                Ok(()) => msgs.push(format!("✓ Tool '{name}' launched")),
+                                Err(e) => msgs.push(format!("✗ Tool '{name}' failed: {e}")),
+                            }
+                        }
+                        Ok(msgs.join("\n"))
+                    } else {
+                        Err("Missing manifest or game prefix".to_string())
+                    }
+                },
+                |result| match result {
+                    Ok(msg) => Message::LogPush(msg),
+                    Err(e) => Message::LogPush(format!("Tray launch all error: {e}")),
+                },
+            )
+        }
+        Message::TrayQuitRequested => {
+            log::info!("Tray: quit requested");
+            if let Some(id) = state.main_window_id {
+                window::close(id)
+            } else {
+                // Fallback if no window ID was captured yet
+                std::process::exit(0);
+            }
+        }
     }
 }
 
@@ -500,6 +759,19 @@ async fn run_setup(
 ) -> Vec<tools::ToolSetupResult> {
     log::info!("run_setup: {} tool(s) to install, prefix = '{}'", tools.len(), prefix_path.display());
     let mut results = Vec::new();
+
+    // Step 0: Install .NET Desktop Runtime if needed (first time only)
+    if !cancelled.load(Ordering::SeqCst) && !tools::is_dotnet_desktop_installed(&prefix_path) {
+        log::info!("Installing .NET Desktop Runtime (required by some tools)...");
+        let prefix = prefix_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            tools::install_dotnet_desktop(&prefix)
+        }).await {
+            Ok(Ok(())) => log::info!(".NET Desktop Runtime installed successfully"),
+            Ok(Err(e)) => log::warn!(".NET Desktop Runtime installation failed (tools may still work): {e}"),
+            Err(e) => log::warn!(".NET install task failed: {e}"),
+        }
+    }
 
     for tool in &tools {
         if cancelled.load(Ordering::SeqCst) {
@@ -514,42 +786,72 @@ async fn run_setup(
         }
 
         log::info!("run_setup: installing '{}'...", tool.name);
-        let tool_owned = tool.clone();
-        let prefix_for_tool = prefix_path.clone();
-        let cancelled = cancelled.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            if cancelled.load(Ordering::SeqCst) {
-                return tools::ToolSetupResult {
-                    slug: tool_owned.slug.clone(),
-                    name: tool_owned.name.clone(),
-                    success: false,
-                    error: Some("Cancelled".to_string()),
-                };
-            }
-            tools::setup_tool(&tool_owned, &prefix_for_tool).unwrap_or_else(|e| tools::ToolSetupResult {
-                slug: tool_owned.slug.clone(),
-                name: tool_owned.name.clone(),
-                success: false,
-                error: Some(e),
-            })
-        }).await;
 
-        let tool_result = match result {
-            Ok(res) => {
-                log::info!("run_setup: '{}' task completed, success={}", tool.name, res.success);
-                res
-            },
-            Err(e) => {
-                log::error!("run_setup: '{}' task panicked: {}", tool.name, e);
-                tools::ToolSetupResult {
+        let retry_delays = [1, 2];
+        let max_attempts = 1 + retry_delays.len();
+        let mut tool_result = None;
+
+        for attempt in 0..max_attempts {
+            if cancelled.load(Ordering::SeqCst) {
+                tool_result = Some(tools::ToolSetupResult {
                     slug: tool.slug.clone(),
                     name: tool.name.clone(),
                     success: false,
-                    error: Some(format!("Spawn error: {e}")),
-                }
-            },
-        };
+                    error: Some("Cancelled".to_string()),
+                });
+                break;
+            }
 
+            if attempt > 0 {
+                let delay = retry_delays[attempt - 1];
+                log::info!("run_setup: retrying '{}' in {}s (attempt {}/{})...", tool.name, delay, attempt + 1, max_attempts);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+
+            let tool_owned = tool.clone();
+            let prefix_for_tool = prefix_path.clone();
+            let cancelled = cancelled.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if cancelled.load(Ordering::SeqCst) {
+                    return tools::ToolSetupResult {
+                        slug: tool_owned.slug.clone(),
+                        name: tool_owned.name.clone(),
+                        success: false,
+                        error: Some("Cancelled".to_string()),
+                    };
+                }
+                tools::setup_tool(&tool_owned, &prefix_for_tool).unwrap_or_else(|e| tools::ToolSetupResult {
+                    slug: tool_owned.slug.clone(),
+                    name: tool_owned.name.clone(),
+                    success: false,
+                    error: Some(e),
+                })
+            }).await;
+
+            let res = match result {
+                Ok(res) => res,
+                Err(e) => {
+                    log::error!("run_setup: '{}' task panicked (attempt {}): {}", tool.name, attempt + 1, e);
+                    tools::ToolSetupResult {
+                        slug: tool.slug.clone(),
+                        name: tool.name.clone(),
+                        success: false,
+                        error: Some(format!("Spawn error: {e}")),
+                    }
+                },
+            };
+
+            if res.success {
+                tool_result = Some(res);
+                break;
+            }
+
+            log::warn!("run_setup: '{}' failed on attempt {}", tool.name, attempt + 1);
+            tool_result = Some(res);
+        }
+
+        let tool_result = tool_result.expect("retry loop should always produce a result");
+        log::info!("run_setup: '{}' completed, success={}", tool.name, tool_result.success);
         results.push(tool_result);
     }
 
@@ -636,7 +938,7 @@ fn view(state: &State) -> Element<'_, Message> {
         .into()
     };
 
-    // Footer buttons: Setup + Tools Dir + Launch
+    // Footer buttons: Setup + Tools Dir + Launch/Re-launch
     let footer_buttons = if state.setup_active {
         row![
             setup_button(),
@@ -645,12 +947,22 @@ fn view(state: &State) -> Element<'_, Message> {
         ]
         .spacing(10)
     } else {
-        row![
-            setup_button(),
-            tools_dir_button(),
-            launch_button(),
-        ]
-        .spacing(10)
+        let launch_row = if state.game_launched {
+            row![
+                setup_button(),
+                tools_dir_button(),
+                relaunch_button(),
+            ]
+            .spacing(10)
+        } else {
+            row![
+                setup_button(),
+                tools_dir_button(),
+                launch_button(),
+            ]
+            .spacing(10)
+        };
+        launch_row
     };
 
     // Log panel
@@ -775,6 +1087,56 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
         .map(|(msg, p)| (msg.as_str(), *p))
         .unwrap_or(("Ready to install", 0.0));
 
+    let downloading = state.proton_setup_progress.is_some() && progress > 0.0;
+
+    let progress_bar: Element<'_, Message> = if downloading {
+        Element::new(column![
+            text(progress_msg)
+                .size(12)
+                .style(|_: &iced::Theme| iced::widget::text::Style {
+                    color: Some(theme::FG),
+                }),
+            container(
+                container(
+                    text("")
+                        .size(1)
+                )
+                .width(Length::FillPortion(((progress * 100.0) as u16).max(1)))
+                .style(|_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(theme::ACCENT)),
+                    ..iced::widget::container::Style::default()
+                })
+            )
+            .height(4)
+            .width(300)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::SURFACE)),
+                ..iced::widget::container::Style::default()
+            })
+        ]
+        .spacing(6))
+    } else {
+        Element::new(container(text("")))
+    };
+
+    let download_section = column![
+        container(download_button()).width(200).align_x(iced::alignment::Horizontal::Center),
+        container(progress_bar).width(200).align_x(iced::alignment::Horizontal::Center),
+    ]
+    .spacing(8)
+    .align_x(iced::alignment::Horizontal::Center);
+
+    let custom_section = column![
+        text("I have Proton already set up, let me use it")
+            .size(16)
+            .style(|_: &iced::Theme| iced::widget::text::Style {
+                color: Some(theme::FG),
+            }),
+        container(custom_path_button()).width(200).align_x(iced::alignment::Horizontal::Center),
+    ]
+    .spacing(8)
+    .align_x(iced::alignment::Horizontal::Center);
+
     let content = column![
         // Title
         text("Proton Not Found")
@@ -791,55 +1153,11 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
             })
             .width(Length::Fill),
 
-        text("You can either download GE-Proton automatically or provide your own installation.")
-            .size(14)
-            .style(|_: &iced::Theme| iced::widget::text::Style {
-                color: Some(theme::MUTED),
-            })
-            .width(Length::Fill),
-
-        // Progress indicator (if downloading)
-        if state.proton_setup_progress.is_some() && progress > 0.0 {
-            let progress_col: Column<Message> = column![
-                text(progress_msg)
-                    .size(12)
-                    .style(|_: &iced::Theme| iced::widget::text::Style {
-                        color: Some(theme::FG),
-                    }),
-                // Simple progress bar
-                container(
-                    container(
-                        text("")
-                            .size(1)
-                    )
-                    .width(Length::FillPortion(((progress * 100.0) as u16).max(1)))
-                    .style(|_: &iced::Theme| iced::widget::container::Style {
-                        background: Some(iced::Background::Color(theme::ACCENT)),
-                        ..iced::widget::container::Style::default()
-                    })
-                )
-                .height(4)
-                .width(Length::Fill)
-                .style(|_: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(theme::SURFACE)),
-                    ..iced::widget::container::Style::default()
-                })
-            ]
-            .spacing(6);
-            Element::new(progress_col)
-        } else {
-            column![].into()
-        },
-
-        // Buttons
-        row![
-            download_button(),
-            custom_path_button(),
-        ]
-        .spacing(12),
+        download_section,
+        custom_section,
 
     ]
-    .spacing(16)
+    .spacing(28)
     .padding(32)
     .width(Length::Fill)
     .align_x(iced::alignment::Horizontal::Center);
@@ -855,11 +1173,11 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
 }
 
 fn download_button() -> iced::widget::Button<'static, Message> {
-    button(text("Download GE-Proton"))
+    button(text("Download Proton"))
         .padding([12, 24])
         .on_press(Message::ProtonDownload)
         .style(|_: &iced::Theme, status: iced::widget::button::Status| {
-            button_download_style(status)
+            button_primary_style(status)
         })
 }
 
@@ -868,21 +1186,21 @@ fn custom_path_button() -> iced::widget::Button<'static, Message> {
         .padding([12, 24])
         .on_press(Message::ProtonPathSelect)
         .style(|_: &iced::Theme, status: iced::widget::button::Status| {
-            button_ghost_style(status)
+            button_custom_style(status)
         })
 }
 
-fn button_download_style(status: iced::widget::button::Status) -> iced::widget::button::Style {
+fn button_custom_style(status: iced::widget::button::Status) -> iced::widget::button::Style {
     let is_hovered = matches!(status, iced::widget::button::Status::Hovered);
 
     iced::widget::button::Style {
         background: Some(iced::Background::Color(if is_hovered {
-            Color::from_rgb(0.3, 0.8, 0.3)
+            Color::from_rgb(0.45, 0.45, 0.45)
         } else {
-            Color::from_rgb(0.2, 0.7, 0.2)
+            Color::from_rgb(0.35, 0.35, 0.35)
         })),
         border: Border {
-            color: Color::from_rgb(0.2, 0.7, 0.2),
+            color: Color::from_rgb(0.25, 0.25, 0.25),
             radius: 6.0.into(),
             width: 0.0,
         },
@@ -904,6 +1222,15 @@ fn launch_button() -> iced::widget::Button<'static, Message> {
     button(text("Launch"))
         .padding(10)
         .on_press(Message::Launch)
+        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+            button_primary_style(status)
+        })
+}
+
+fn relaunch_button() -> iced::widget::Button<'static, Message> {
+    button(text("Re-launch Game"))
+        .padding(10)
+        .on_press(Message::LaunchBypass)
         .style(|_: &iced::Theme, status: iced::widget::button::Status| {
             button_primary_style(status)
         })
@@ -986,6 +1313,52 @@ fn button_ghost_style(status: iced::widget::button::Status) -> iced::widget::but
     }
 }
 
-fn subscription(_state: &State) -> Subscription<Message> {
-    Subscription::none()
+fn subscription(state: &State) -> Subscription<Message> {
+    // 1. Close-request interception — user clicks X → hide to tray
+    let close_events = window::close_requests().map(|_| Message::CloseRequested);
+
+    // 2. Tray event stream
+    let listener = TrayListener(state.tray_rx.clone());
+    let tray_events = Subscription::run_with(listener, |data: &TrayListener| {
+        let rx = data.0.clone();
+        stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
+            let rx = rx.clone();
+            async move {
+                // Scope the MutexGuard so it's dropped before any .await
+                let receiver = {
+                    let mut guard = rx.lock().unwrap();
+                    match guard.take() {
+                        Some(r) => r,
+                        None => return, // already consumed
+                    }
+                };
+
+                loop {
+                    match receiver.try_recv() {
+                        Ok(tray::TrayMessage::Show) => {
+                            let _ = output.send(Message::TrayShowRequested).await;
+                        }
+                        Ok(tray::TrayMessage::LaunchGame) => {
+                            let _ = output.send(Message::TrayLaunchGame).await;
+                        }
+                        Ok(tray::TrayMessage::LaunchAll) => {
+                            let _ = output.send(Message::TrayLaunchAll).await;
+                        }
+                        Ok(tray::TrayMessage::Quit) => {
+                            let _ = output.send(Message::TrayQuitRequested).await;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+        })
+    });
+
+    // 3. Window open events — capture the main window ID
+    let window_opens = window::open_events().map(Message::WindowOpened);
+
+    Subscription::batch(vec![close_events, tray_events, window_opens])
 }

@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -284,21 +285,37 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Find the first executable file (.exe, .jar, .bat, .cmd) in a directory recursively.
 /// Returns the relative path from the given directory.
+/// Prefers main executables over helper binaries in subdirectories like "Components".
 pub fn find_executable(dir: &Path) -> Option<PathBuf> {
     let mut results: Vec<PathBuf> = Vec::new();
     find_exec_recursive(dir, dir, &mut results);
 
     // Prefer .exe files, then .jar, then .bat/.cmd
-    results
-        .iter()
-        .find(|p| p.extension().map_or(false, |e| e == "exe"))
-        .or_else(|| results.iter().find(|p| p.extension().map_or(false, |e| e == "jar")))
-        .or_else(|| {
-            results.iter().find(|p| {
-                p.extension().map_or(false, |e| e == "bat" || e == "cmd")
-            })
+    // Skip "Components" subdirectory executables (they're helper binaries that need special args)
+    let skip_components = |p: &PathBuf| -> bool {
+        p.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("components")
         })
-        .cloned()
+    };
+
+    let find_preferred = |ext: &str, results: &[PathBuf]| -> Option<PathBuf> {
+        // First try non-Components executables
+        let non_comp: Vec<_> = results.iter().filter(|p| !skip_components(p)).collect();
+        if let Some(match_) = non_comp.iter().find(|p| p.extension().map_or(false, |e| e == ext)) {
+            return Some(match_.to_path_buf());
+        }
+        // Fall back to any match
+        results.iter().find(|p| p.extension().map_or(false, |e| e == ext)).cloned()
+    };
+
+    find_preferred("exe", &results)
+        .or_else(|| find_preferred("jar", &results))
+        .or_else(|| {
+            find_preferred("bat", &results)
+                .or_else(|| find_preferred("cmd", &results))
+        })
 }
 
 fn find_exec_recursive(base: &Path, dir: &Path, results: &mut Vec<PathBuf>) {
@@ -331,4 +348,66 @@ fn find_exec_recursive(base: &Path, dir: &Path, results: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Check if .NET Desktop Runtime is already installed in the prefix.
+/// Uses a marker file at `<prefix>/.dotnet_desktop_installed`.
+pub fn is_dotnet_desktop_installed(prefix_path: &Path) -> bool {
+    prefix_path.join(".dotnet_desktop_installed").exists()
+}
+
+/// Install .NET Desktop Runtime into the Proton prefix using winetricks.
+/// Tries `dotnetdesktop9` first, then falls back to older versions.
+pub fn install_dotnet_desktop(prefix_path: &Path) -> Result<(), String> {
+    log::info!("Installing .NET Desktop Runtime into prefix: {}", prefix_path.display());
+
+    let winetricks = "winetricks";
+
+    let run_verb = |verb: &str| -> Result<(), String> {
+        let output = Command::new(winetricks)
+            .arg("-q")
+            .arg(verb)
+            .env("WINEPREFIX", prefix_path)
+            .output()
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    "winetricks not found in PATH. Please install winetricks first.\n  Arch: sudo pacman -S winetricks\n  Debian/Ubuntu: sudo apt install winetricks".to_string()
+                } else {
+                    format!("Failed to run winetricks: {e}")
+                }
+            })?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("winetricks {} failed: {stderr}", verb))
+        }
+    };
+
+    let verbs = ["dotnetdesktop9", "dotnetdesktop8", "dotnet48"];
+    let mut last_err = String::new();
+
+    for verb in &verbs {
+        log::info!("Trying winetricks {} ...", verb);
+        match run_verb(verb) {
+            Ok(()) => {
+                log::info!("winetricks {} succeeded", verb);
+                let _ = fs::write(prefix_path.join(".dotnet_desktop_installed"), "installed");
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("{}", e);
+                last_err = e;
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to install .NET Desktop Runtime (tried {}). Last error: {last_err}\n\
+         You can install it manually:\n  WINEPREFIX={} {} -q dotnetdesktop9",
+        verbs.join(", "),
+        prefix_path.display(),
+        winetricks
+    ))
 }

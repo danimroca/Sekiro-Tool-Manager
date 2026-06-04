@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::os::unix::process::CommandExt;
 
 /// Information about the detected game process.
 #[derive(Debug, Clone)]
@@ -104,8 +105,47 @@ fn find_wine_binary(
         }
     }
 
-    // Try standard Steam locations
+    // Try protontricks location (common when using protontricks)
     let home = std::env::var("HOME").ok()?;
+    let protontricks_dir = format!("{home}/.cache/protontricks/proton");
+    if let Ok(entries) = std::fs::read_dir(&protontricks_dir) {
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name().map_or(false, |n| {
+                        n.to_string_lossy().starts_with("GE-Proton")
+                    })
+            })
+            .collect();
+        versions.sort_by(|a, b| {
+            let parse_ver = |p: &Path| -> (u32, u32) {
+                let name = match p.file_name() {
+                    Some(n) => n.to_string_lossy(),
+                    None => return (0, 0),
+                };
+                let stripped = match name.strip_prefix("GE-Proton") {
+                    Some(s) => s,
+                    None => return (0, 0),
+                };
+                let parts: Vec<&str> = stripped.split('-').collect();
+                let major = parts[0].parse().unwrap_or(0);
+                let minor = parts[1].parse().unwrap_or(0);
+                (major, minor)
+            };
+            parse_ver(a).cmp(&parse_ver(b))
+        });
+        if let Some(latest) = versions.last() {
+            let wine_path = latest.join("files").join("bin").join("wine");
+            if wine_path.exists() {
+                log::info!("Using protontricks Proton path: {}", latest.display());
+                return Some(wine_path);
+            }
+        }
+    }
+
+    // Try standard Steam locations
     for base in [
         format!("{home}/.local/share/Steam"),
         format!("{home}/.steam/root"),
@@ -151,6 +191,246 @@ fn find_wine_binary(
     }
 
     None
+}
+
+/// Check if a process with the given executable name is currently running.
+pub fn is_process_running(exe_name: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", exe_name])
+        .output()
+        .map(|out| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            !stdout.trim().is_empty() && out.status.success()
+        })
+        .unwrap_or(false)
+}
+
+/// Find the Steam library base directory (contains `steamapps/`).
+fn find_steam_library() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let candidates = [
+        format!("{home}/.local/share/Steam"),
+        format!("{home}/.steam/root"),
+        format!("{home}/Steam"),
+        format!("{home}/.var/app/com.valvesoftware.Steam/.steam/root"),
+    ];
+    for base in &candidates {
+        let steamapps = format!("{base}/steamapps");
+        let manifest = format!("{steamapps}/appmanifest_814380.appmanifest");
+        if Path::new(&steamapps).is_dir() && Path::new(&manifest).exists() {
+            return Some(PathBuf::from(base));
+        }
+    }
+    // Fallback: just return any Steam directory with steamapps
+    for base in &candidates {
+        let steamapps = format!("{base}/steamapps");
+        if Path::new(&steamapps).is_dir() {
+            return Some(PathBuf::from(base));
+        }
+    }
+    None
+}
+
+/// Find the Sekiro game directory on the Linux filesystem.
+/// Tries multiple common directory names since Steam's install dir name
+/// varies between "Sekiro Sekiro Shadows Die Again" and just "Sekiro".
+pub fn find_sekiro_game_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+
+    // Common Steam library base paths
+    let steam_bases: Vec<PathBuf> = [
+        format!("{home}/.local/share/Steam"),
+        format!("{home}/.steam/root"),
+        format!("{home}/Steam"),
+        format!("{home}/.var/app/com.valvesoftware.Steam/.steam/root"),
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .filter(|p| p.join("steamapps").exists())
+    .collect();
+
+    // Common install directory names (in priority order)
+    let install_names = [
+        "Sekiro Sekiro Shadows Die Again",
+        "Sekiro",
+    ];
+
+    // First try parsing the appmanifest for the exact install dir name
+    let manifest_candidates = [
+        format!("{home}/.local/share/Steam/steamapps/appmanifest_814380.appmanifest"),
+        format!("{home}/.steam/root/steamapps/appmanifest_814380.appmanifest"),
+        format!("{home}/Steam/steamapps/appmanifest_814380.appmanifest"),
+        format!("{home}/.var/app/com.valvesoftware.Steam/.steam/root/steamapps/appmanifest_814380.appmanifest"),
+    ];
+
+    let mut manifest_name: Option<String> = None;
+    for manifest_path in &manifest_candidates {
+        if let Ok(content) = std::fs::read_to_string(manifest_path) {
+            if let Some(name) = parse_manifest_install_dir(&content) {
+                manifest_name = Some(name);
+                break;
+            }
+        }
+    }
+
+    // Try manifest name first if found, then common names
+    let mut candidates: Vec<String> = match manifest_name {
+        Some(name) => {
+            let mut names = vec![name];
+            names.extend(install_names.iter().map(|s| s.to_string()));
+            names
+        }
+        None => install_names.iter().map(|s| s.to_string()).collect(),
+    };
+
+    // Remove duplicates while preserving order
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|n| seen.insert(n.clone()));
+
+    // Search all Steam libraries
+    for base in &steam_bases {
+        for name in &candidates {
+            let game_dir = base.join("steamapps").join("common").join(name);
+            if game_dir.exists() {
+                // Confirm with steam appid file
+                if game_dir.join("check-steam_appid.txt").exists()
+                    || game_dir.join("steam_appid.txt").exists()
+                    || game_dir.join("sekiro.exe").exists()
+                {
+                    log::info!("Found Sekiro game dir: {}", game_dir.display());
+                    return Some(game_dir);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse the Steam appmanifest to extract the install directory name.
+/// The manifest contains a line like `"installdir" "Sekiro Sekiro Shadows Die Again"`.
+fn parse_manifest_install_dir(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("\"installdir\"") {
+            // Extract the value between quotes after "installdir"
+            if let Some(start) = trimmed.find('"') {
+                let rest = &trimmed[start + 1..];
+                if let Some(end) = rest.find('"') {
+                    return Some(rest[..end].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Launch Sekiro, bypassing Steam's "game is running" check.
+///
+/// Strategy (tried in order):
+/// 1. `steam -applaunch 814380` — Steam CLI, bypasses the launcher check
+/// 2. Direct Proton launch — finds the game executable and launches it directly
+///    with `process_group(0)` and `SteamAppId`/`SteamGameId` env vars.
+pub fn launch_sekiro_bypass(
+    prefix_path: &Path,
+    proton_path: &Option<String>,
+) -> Result<(), anyhow::Error> {
+  // Don't kill anything — the direct Proton launch below bypasses Steam entirely,
+    // so Steam's "game is running" check is never triggered.
+
+    // Direct Proton launch — bypasses Steam entirely to avoid
+    // Steam's "game is running" check that blocks re-launch.
+    let game_dir = find_sekiro_game_dir()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Could not find Sekiro game directory. Make sure Sekiro is installed via Steam."
+        ))?;
+
+    // Try the Linux launcher script first (sekiro.sh), then the Windows exe
+    let linux_script = game_dir.join("sekiro.sh");
+    let windows_exe = game_dir.join("sekiro.exe");
+
+    let game_exe = if linux_script.exists() {
+        log::info!("Using Linux launcher script: {}", linux_script.display());
+        linux_script
+    } else if windows_exe.exists() {
+        log::info!("Using Windows executable: {}", windows_exe.display());
+        windows_exe
+    } else {
+        return Err(anyhow::anyhow!(
+            "Neither sekiro.sh nor sekiro.exe found in: {}",
+            game_dir.display()
+        ));
+    };
+
+    let wine_bin = find_wine_binary(&None, proton_path)
+        .ok_or_else(|| anyhow::anyhow!("Could not find GE-Proton wine binary"))?;
+
+    log::info!("Found wine binary: {}", wine_bin.display());
+
+    let proton_dir = wine_bin
+        .parent()           // files/bin
+        .and_then(|p| p.parent())  // files
+        .and_then(|p| p.parent())  // GE-Proton10-XX (tool root where proton binary lives)
+        .ok_or_else(|| anyhow::anyhow!("Could not determine Proton directory"))?;
+
+    log::info!(
+        "Derived proton_dir: {}, exists={}",
+        proton_dir.display(),
+        proton_dir.exists()
+    );
+
+    let proton_bin = proton_dir.join("proton");
+    log::info!(
+        "Proton binary path: {}, exists={}",
+        proton_bin.display(),
+        proton_bin.exists()
+    );
+
+    // Derive STEAM_COMPAT_DATA_PATH from the prefix path
+    // prefix_path is .../compatdata/814380/pfx, so compat_data_path is .../compatdata/814380
+    let compat_data_path = prefix_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine compat data path from prefix"))?;
+
+    // Find the Steam client install path (where steam.sh lives)
+    let home = std::env::var("HOME").ok();
+    let steam_client_path = [
+        format!("{}/.local/share/Steam", home.as_deref().unwrap_or("")),
+        format!("{}/.steam/steam", home.as_deref().unwrap_or("")),
+        format!("{}/.steam/root", home.as_deref().unwrap_or("")),
+        format!("{}/Steam", home.as_deref().unwrap_or("")),
+    ]
+    .iter()
+    .find_map(|p| {
+        let path = PathBuf::from(p);
+        if path.exists() { Some(path) } else { None }
+    })
+    .unwrap_or_else(|| {
+        home.map(|h| PathBuf::from(format!("{h}/.local/share/Steam")))
+            .unwrap_or_default()
+    });
+
+    log::info!(
+        "Compat data path: {}, Steam client path: {}",
+        compat_data_path.display(),
+        steam_client_path.display()
+    );
+
+    let mut command = std::process::Command::new(&proton_bin);
+    command
+        .args(["run", &game_exe.to_string_lossy()])
+        .env("WINEPREFIX", prefix_path)
+        .env("STEAM_COMPAT_DATA_PATH", compat_data_path)
+        .env("STEAM_COMPAT_TOOL_PATH", proton_dir)
+        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_client_path)
+        .env("SteamAppId", "814380")
+        .env("SteamGameId", "814380")
+        .current_dir(&game_dir)
+        .process_group(0)
+        .spawn()?;
+
+    log::info!("Sekiro launched via Proton bypass");
+    Ok(())
 }
 
 /// Launch Sekiro via steam:// protocol.
@@ -216,6 +496,7 @@ pub fn launch_tool(
 }
 
 /// Launch all tools alongside Sekiro. Returns a list of launched tool names and any errors.
+/// Skips tools whose executable is already running (detected via pgrep).
 pub fn launch_tools(
     tools: &[&Path],
     prefix_path: &Path,
@@ -229,6 +510,12 @@ pub fn launch_tools(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| tool_path.display().to_string());
+
+        if is_process_running(&tool_name) {
+            log::info!("Skipping '{}' - already running", tool_name);
+            results.push((tool_name, Ok(())));
+            continue;
+        }
 
         log::info!("Launching tool: {} at {}", tool_name, tool_path.display());
 

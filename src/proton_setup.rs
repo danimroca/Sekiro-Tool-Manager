@@ -22,15 +22,24 @@ pub const DEFAULT_PROTON_TAG: &str = "GE-Proton10-26";
 fn fetch_release_urls() -> Result<(String, String), anyhow::Error> {
     let client = reqwest::blocking::Client::new();
     let url = format!(
-        "https://api.github.com/repos/{}/{}/releases/tags/{}",
-        DEFAULT_PROTON_REPO, DEFAULT_PROTON_VERSION, DEFAULT_PROTON_TAG
+        "https://api.github.com/repos/{}/releases/tags/{}",
+        DEFAULT_PROTON_REPO, DEFAULT_PROTON_TAG
     );
 
-    let response = client.get(&url).send()?;
+    eprintln!("Fetching release info from: {url}");
+    let response = client.get(&url)
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("User-Agent", "sekiro-launcher")
+        .send()?;
+    eprintln!("GitHub API response status: {}", response.status());
+
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text()?;
+        eprintln!("GitHub API response body: {body}");
         return Err(anyhow::anyhow!(
-            "Failed to fetch release info: HTTP {}",
-            response.status().as_u16()
+            "Failed to fetch release info: HTTP {} - {body}",
+            status
         ));
     }
 
@@ -287,10 +296,9 @@ pub fn choose_proton_directory() -> Result<PathBuf, String> {
 
 /// Open the file explorer at the tools directory inside the game prefix.
 pub fn open_tools_directory(game_prefix: &Path) -> Result<(), String> {
-    let tools_dir = game_prefix.join("tools");
-    if !tools_dir.exists() {
-        return Err(format!("Tools directory does not exist yet: {tools_dir:?}"));
-    }
+    let tools_dir = game_prefix.join("drive_c").join("tools");
+    fs::create_dir_all(&tools_dir)
+        .map_err(|e| format!("Failed to create tools directory: {e}"))?;
 
     let output = Command::new("xdg-open")
         .arg(&tools_dir)
@@ -303,8 +311,7 @@ pub fn open_tools_directory(game_prefix: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Err("Failed to open file explorer: xdg-open not found. Please navigate to {}/tools manually"
-                .replace("/", &std::path::MAIN_SEPARATOR.to_string()))
+            Err(format!("Failed to open file explorer: xdg-open not found. Please navigate to {}/drive_c/tools manually", game_prefix.display()))
         }
         Err(e) => Err(format!("Failed to open file explorer: {e}")),
     }

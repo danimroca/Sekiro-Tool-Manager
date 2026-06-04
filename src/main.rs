@@ -6,6 +6,7 @@ mod proton_setup;
 mod theme;
 mod tools;
 mod toast;
+mod tray;
 mod ui;
 
 fn main() -> iced::Result {

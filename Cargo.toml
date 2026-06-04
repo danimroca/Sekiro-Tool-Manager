@@ -5,20 +5,33 @@ edition = "2021"
 description = "A native Linux desktop app for downloading, installing, and launching speedrun tools alongside Sekiro."
 
 [dependencies]
-iced = { version = "0.14", features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+#iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia",  "wayland", "x11"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 iced_toasts = "0.1"
-tray = "0.1"
+ksni = { version = "0.3", features = ["blocking"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 env_logger = "0.11"
-zip = "2"
+#env_logger = { version = "0.11", optional = true }
+#simple_logger = "5"
+#zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
-flate2 = "1"
+#flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 log = "0.4"
 dirs = "5"
 sha2 = "0.10"
 shellexpand = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
