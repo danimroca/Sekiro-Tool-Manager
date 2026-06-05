@@ -1,6 +1,6 @@
 # Sekiro Tools Launcher
 
-A native Linux desktop app for downloading, installing, and launching speedrun tools alongside [Sekiro: Shadows Die Again](https://www.sekiro-game.com) via Steam and Proton.
+A native Linux desktop app for downloading, installing, and launching speedrun tools alongside [Sekiro: Shadows Die Twice](https://www.sekirothegame.com/) via Steam and Proton.
 
 ## Features
 
