@@ -50,4 +50,6 @@ jobs:
           pkgname: sekiro-launcher-iced-bin
           pkgbuild: ./PKGBUILD
           commit_message: "update to ${{ github.event.release.tag_name }}"
+          commit_username: danimroca
+          commit_email: danim.roca@gmail.com
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
