@@ -1,6 +1,6 @@
 [package]
 name = "sekiro-launcher"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A native Linux desktop app for downloading, installing, and launching speedrun tools alongside Sekiro."
 repository = "https://github.com/danimroca/Sekiro-Tool-Manager"
