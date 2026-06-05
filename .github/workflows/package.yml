@@ -1,0 +1,52 @@
+# .github/workflows/package.yml
+name: Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-linux-packages:
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build binary
+        run: cargo build --release
+      - name: Install nfpm
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
+            | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt update && sudo apt install -y nfpm
+      - name: Build deb and rpm
+        run: |
+          mkdir -p dist
+          export VERSION=${VERSION#v}
+          nfpm package --packager deb --target ./dist/
+          nfpm package --packager rpm --target ./dist/
+      - name: Upload to release
+        run: |
+          gh release upload "$VERSION" ./dist/*.deb ./dist/*.rpm
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-aur:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update PKGBUILD version
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          sed -i "s/pkgver=.*/pkgver=${VERSION#v}/" PKGBUILD
+          sed -i "s/pkgrel=.*/pkgrel=1/" PKGBUILD
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2
+        with:
+          pkgname: sekiro-launcher-iced-bin
+          pkgbuild: ./PKGBUILD
+          commit_message: "update to ${{ github.event.release.tag_name }}"
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

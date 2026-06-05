@@ -211,53 +211,12 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-  
-  #Build and package linux installers
-  build-linux-packages:
-  needs:
-    - plan
-    - build-local-artifacts
-  if: ${{ needs.plan.outputs.publishing == 'true' }}
-  runs-on: ubuntu-22.04
-  env:
-    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    VERSION: ${{ needs.plan.outputs.tag }}
-  steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Build binary
-      run: cargo build --release
-
-    - name: Install nfpm
-      run: |
-        echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
-          | sudo tee /etc/apt/sources.list.d/goreleaser.list
-        sudo apt update && sudo apt install -y nfpm
-
-    - name: Build deb and rpm
-      run: |
-        mkdir -p dist
-        # strip v prefix from tag if present
-        export VERSION=${VERSION#v}
-        nfpm package --packager deb --target ./dist/
-        nfpm package --packager rpm --target ./dist/
-
-    - name: Upload packages
-      uses: actions/upload-artifact@v4
-      with:
-        name: artifacts-linux-packages
-        path: ./dist/*.{deb,rpm}
-
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-      - build-linux-packages
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
