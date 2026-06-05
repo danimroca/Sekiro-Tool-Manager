@@ -29,9 +29,14 @@ impl Manifest {
         }
     }
 
-    fn default() -> Self {
+    /// Return the hardcoded built-in tool definitions (used as boot default + remote fallback).
+    pub fn builtin() -> Self {
         let tools = tool_defs();
         Self { tools }
+    }
+
+    fn default() -> Self {
+        Self::builtin()
     }
 }
 

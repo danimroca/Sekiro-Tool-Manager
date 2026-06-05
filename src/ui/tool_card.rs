@@ -15,6 +15,10 @@ pub enum ToolStatus {
     NotInstalled,
     /// Tool installation failed.
     Broken,
+    /// Tool status is being checked.
+    Checking,
+    /// Tool is currently being installed.
+    Installing,
 }
 
 impl ToolStatus {
@@ -23,6 +27,8 @@ impl ToolStatus {
             Self::Installed => "Active",
             Self::NotInstalled => "Not installed",
             Self::Broken => "Broken",
+            Self::Checking => "Checking",
+            Self::Installing => "Installing",
         }
     }
 
@@ -31,6 +37,8 @@ impl ToolStatus {
             Self::Installed => theme::SUCCESS,
             Self::NotInstalled => theme::ACCENT2,
             Self::Broken => theme::ERROR,
+            Self::Checking => theme::ACCENT2,
+            Self::Installing => theme::ACCENT,
         }
     }
 
@@ -39,6 +47,8 @@ impl ToolStatus {
             Self::Installed => Color::from_rgb(0.078, 0.118, 0.078),
             Self::NotInstalled => theme::TAG_BG,
             Self::Broken => Color::from_rgb(0.15, 0.06, 0.06),
+            Self::Checking => Color::from_rgb(0.12, 0.12, 0.18),
+            Self::Installing => Color::from_rgb(0.18, 0.08, 0.06),
         }
     }
 }

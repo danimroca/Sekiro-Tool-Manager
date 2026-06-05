@@ -172,12 +172,8 @@ pub fn download_and_install_proton(
     let decoder = flate2::read::GzDecoder::new(tar_file);
     let mut archive = Archive::new(decoder);
 
-    let entries = archive.entries().map_err(|e| format!("Failed to read archive: {e}"))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {e}"))?;
-        entry.unpack(&compat_dir)
-            .map_err(|e| format!("Failed to extract: {e}"))?;
-    }
+    archive.unpack(&compat_dir)
+        .map_err(|e| format!("Failed to extract tarball into {}: {e}", compat_dir.display()))?;
 
     // Find the extracted directory (it should be the proton version dir)
     let extracted_dir = compat_dir.join(DEFAULT_PROTON_VERSION);

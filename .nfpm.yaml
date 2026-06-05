@@ -1,0 +1,9 @@
+name: sekiro-launcher-iced
+version: ${VERSION}
+arch: amd64
+maintainer: Daniel danim.roca@mgial.com
+description: Sekiro launcher
+license: MIT
+contents:
+  - src: ./target/release/sekiro-launcher-iced
+    dst: /usr/bin/sekiro-launcher-iced

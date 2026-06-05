@@ -20,17 +20,17 @@ A native Linux desktop GUI for downloading, installing, and launching speedrun t
 
 | Tool | Description |
 |---|---|
-| **LiveSplit** | Speedrun timer with racing and layout system |
-| **Save Organizer** | Manage savefiles for the Souls series — bundled JRE |
-| **Practice Tool** | Sekiro practice tool with indicators and speed modifier |
-| **Save Helper** | Local save game management (backup, restore, import) |
-| **SekiroTool** | Noclip, speed modifier, AI disable, camera shake controls, and cutscene skip |
+| [**LiveSplit**](https://github.com/LiveSplit/LiveSplit) | Speedrun timer with racing and layout system |
+| [**Save Organizer**](https://github.com/Kahmul/SoulsSpeedruns-Save-Organizer) | Manage savefiles for the Souls series — bundled JRE |
+| [**Practice Tool**](https://github.com/veeenu/sekiro-practice-tool) | Sekiro practice tool with indicators and speed modifier |
+| [**Save Helper**](https://github.com/uberhalit/SimpleSekiroSavegameHelper) | Local save game management (backup, restore, import) |
+| [**SekiroTool**](https://github.com/borgCode/SekiroTool) | An offline practice tool for challenge running in Sekiro |
 
 ## Requirements
 
 - **Linux** (any distribution that runs Steam/Proton)
-- [Steam](https://store.steampowered.com) with Sekiro installed (AppID: 814380)
-- [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) in your Steam compatibility tools directory
+- [Steam](https://store.steampowered.com) with (Sekiro)[https://store.steampowered.com/app/814380/Sekiro_Shadows_Die_Twice__GOTY_Edition/] installed (AppID: 814380)
+- Proton in your Steam compatibility tools directory. Recommended [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) 10-26, more recent versions may not work with all the tools.
 - **Runtime dependencies**: `zenity` (directory chooser), `xdotool` (game window detection), `winetricks` (.NET installation), `xdg-open` (file opening), `pgrep` (process detection)
 
 ## Installation

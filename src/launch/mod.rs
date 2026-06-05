@@ -1,3 +1,5 @@
+use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::os::unix::process::CommandExt;
@@ -70,6 +72,104 @@ pub async fn wait_for_game() -> Option<GameInfo> {
         log::debug!("Waiting for Sekiro window...");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+/// Check if a directory contains a valid wine binary (both GE-Proton and standard Proton layouts).
+fn has_wine_binary(dir: &Path) -> bool {
+    dir.join("files").join("bin").join("wine").exists()
+        || dir.join("dist").join("bin").join("wine").exists()
+}
+
+/// Return the wine binary path from a Proton directory.
+fn wine_binary_path(proton_dir: &Path) -> PathBuf {
+    let ge_path = proton_dir.join("files").join("bin").join("wine");
+    if ge_path.exists() {
+        ge_path
+    } else {
+        proton_dir.join("dist").join("bin").join("wine")
+    }
+}
+
+/// Collect all Steam library root directories from common locations and libraryfolders.vdf.
+fn find_steam_roots() -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut roots = Vec::new();
+
+    // Common Steam install locations
+    for base in [
+        format!("{home}/.local/share/Steam"),
+        format!("{home}/.steam/steam"),
+        format!("{home}/.steam/root"),
+        format!("{home}/Steam"),
+    ] {
+        let p = PathBuf::from(&base);
+        if p.join("steamapps").is_dir() {
+            roots.push(p);
+        }
+    }
+
+    // Parse libraryfolders.vdf for additional library paths
+    for root in roots.clone() {
+        let vdf_path = root.join("steamapps/libraryfolders.vdf");
+        if let Ok(file) = fs::File::open(&vdf_path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim();
+                if let Some(path_val) = trimmed.strip_prefix("\"path\"\t\t\"") {
+                    if let Some(end) = path_val.rfind('"') {
+                        let lib_path = &path_val[..end];
+                        let lib_root = PathBuf::from(lib_path);
+                        if lib_root.join("steamapps").is_dir() && !roots.contains(&lib_root) {
+                            roots.push(lib_root);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    roots
+}
+
+/// Find the latest standard Steam Proton installation (e.g. Proton-9.0) in steamapps/common/
+/// across all Steam library folders. Returns the path to the wine binary.
+fn find_steam_proton() -> Option<PathBuf> {
+    let roots = find_steam_roots();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    for root in &roots {
+        let common = root.join("steamapps/common");
+        if !common.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&common) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = path.file_name()?.to_string_lossy();
+                if name.starts_with("Proton-") && has_wine_binary(&path) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    // Sort by version descending and return the latest
+    candidates.sort_by(|a, b| {
+        let parse_ver = |p: &Path| -> (u32, u32) {
+            let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            let stripped = name.strip_prefix("Proton-").unwrap_or("");
+            let parts: Vec<&str> = stripped.split('.').collect();
+            let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            (major, minor)
+        };
+        parse_ver(b).cmp(&parse_ver(a))
+    });
+
+    candidates.first().map(|p| wine_binary_path(p))
 }
 
 /// Find the GE-Proton wine binary, prioritizing the detected game proton path.
@@ -182,12 +282,18 @@ fn find_wine_binary(
                 parse_ver(a).cmp(&parse_ver(b))
             });
             if let Some(latest) = versions.last() {
-                let wine_path = latest.join("files").join("bin").join("wine");
+                let wine_path = wine_binary_path(&latest);
                 if wine_path.exists() {
                     return Some(wine_path);
                 }
             }
         }
+    }
+
+    // Try standard Steam Proton installations (Proton-9.0, etc.) in steamapps/common/
+    if let Some(wine_path) = find_steam_proton() {
+        log::info!("Using standard Steam Proton: {}", wine_path.display());
+        return Some(wine_path);
     }
 
     None

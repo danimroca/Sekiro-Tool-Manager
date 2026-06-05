@@ -1,23 +1,38 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{button, column, container, row, text, Column};
-use iced::{Border, Color, Element, Length, Subscription, Task};
-use iced::{stream, window};
+use iced::{stream, window, Border, Color, Element, Length, Subscription, Task};
 use iced::futures::SinkExt;
 
 use crate::config::Config;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ToolEntry};
 use crate::proton_setup;
 use crate::theme;
 use crate::tools;
 use crate::tray;
 use crate::ui;
+use crate::ui::tool_card::ToolStatus;
 
 /// Wrapper so the tray receiver can be used as a `Subscription` identity
 /// (it must be `Hash`, which `Mutex` is not).
+struct ProtonProgressWatcher(Arc<Mutex<Option<tokio::sync::watch::Receiver<(String, f32)>>>>);
+
+impl std::hash::Hash for ProtonProgressWatcher {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        1usize.hash(state);
+    }
+}
+
+impl Clone for ProtonProgressWatcher {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 struct TrayListener(Arc<Mutex<Option<mpsc::Receiver<tray::TrayMessage>>>>);
 
 impl std::hash::Hash for TrayListener {
@@ -32,6 +47,8 @@ impl Clone for TrayListener {
         Self(self.0.clone())
     }
 }
+
+
 
 pub fn run() -> iced::Result {
     iced::application(
@@ -58,6 +75,10 @@ pub struct State {
     // Proton setup state
     proton_setup_active: bool,
     proton_setup_progress: Option<(String, f32)>,
+    proton_watch_rx: Arc<Mutex<Option<tokio::sync::watch::Receiver<(String, f32)>>>>,
+
+    // Per-tool installation status
+    tool_statuses: HashMap<String, ToolStatus>,
 
     // Tool setup state
     setup_active: bool,
@@ -95,6 +116,7 @@ pub enum Message {
     LogPush(String),
     LogToggle,
     LogDismiss,
+    ToolStatusChecked { slug: String, installed: bool },
     SetupDone(Vec<tools::ToolSetupResult>),
     LaunchBypass,
     // Tray / window events
@@ -122,9 +144,16 @@ impl State {
         let tray_rx_raw = tray::spawn();
         let tray_rx = Arc::new(Mutex::new(Some(tray_rx_raw)));
 
+        // Show cards immediately using the built-in tool definitions
+        let builtin = Manifest::builtin();
+        let mut tool_statuses = HashMap::new();
+        for tool in &builtin.tools {
+            tool_statuses.insert(tool.slug.clone(), ToolStatus::Checking);
+        }
+
         (
             State {
-                manifest: None,
+                manifest: Some(builtin),
                 config: Config::default(),
                 proton_path: None,
                 game_prefix_path: None,
@@ -133,6 +162,9 @@ impl State {
 
                 proton_setup_active: false,
                 proton_setup_progress: None,
+                proton_watch_rx: Arc::new(Mutex::new(None)),
+
+                tool_statuses,
 
                 setup_active: false,
                 setup_progress: Vec::new(),
@@ -164,11 +196,45 @@ impl State {
     }
 }
 
+fn check_all_tools(state: &mut State, tools: &[ToolEntry], prefix: &Path) -> Task<Message> {
+    let mut tasks = Vec::new();
+
+    for tool in tools {
+        let slug = tool.slug.clone();
+        state.tool_statuses.insert(slug.clone(), ToolStatus::Checking);
+
+        let tool = tool.clone();
+        let prefix = prefix.to_path_buf();
+
+        tasks.push(Task::perform(
+            async move {
+                let installed = tokio::task::spawn_blocking(move || {
+                    tools::is_installed(&tool, &prefix)
+                })
+                .await
+                .unwrap_or(false);
+                Message::ToolStatusChecked { slug, installed }
+            },
+            std::convert::identity,
+        ));
+    }
+
+    Task::batch(tasks)
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::ManifestLoaded(Ok(manifest)) => {
-            state.manifest = Some(manifest);
-            Task::none()
+            state.manifest = Some(manifest.clone());
+            if let Some(prefix) = &state.game_prefix_path.clone() {
+                check_all_tools(state, &manifest.tools, prefix)
+            } else {
+                // Mark all as Checking; checks will spawn once ConfigLoaded arrives
+                for tool in &manifest.tools {
+                    state.tool_statuses.insert(tool.slug.clone(), ToolStatus::Checking);
+                }
+                Task::none()
+            }
         }
         Message::ManifestLoaded(Err(e)) => {
             state.log_messages.push(format!("Failed to load manifest: {e}"));
@@ -187,16 +253,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 .or_else(|| std::env::var("SEKIRO_PROTON_PATH").ok().map(PathBuf::from))
                 .and_then(|p| p.canonicalize().ok());
 
-            state.game_prefix_path = Some(state.config.game_prefix.resolved_path());
+            let prefix = state.config.game_prefix.resolved_path();
+            state.game_prefix_path = Some(prefix.clone());
 
             // If no proton path is configured in the config file, show the setup screen
             if state.config.proton.path.is_none() && !state.proton_setup_active {
                 state.proton_setup_active = true;
             }
 
-            Task::none()
+            // If manifest is already loaded, spawn per-tool verification checks
+            if let Some(manifest) = &state.manifest.clone() {
+                check_all_tools(state, &manifest.tools, &prefix)
+            } else {
+                Task::none()
+            }
         }
-        Message::ConfigLoaded(Err(_)) => {
+        Message::ConfigLoaded(Err(e)) => {
+            log::warn!("Config load failed: {e}. Falling back to defaults.");
+            // Set a default prefix so the UI can still function
+            let default_prefix = crate::config::GamePrefixConfig::default_path();
+            state.game_prefix_path = Some(default_prefix);
+            // If manifest already loaded, mark all tools as NotInstalled
+            if state.manifest.is_some() {
+                for (_, v) in state.tool_statuses.iter_mut() {
+                    *v = ToolStatus::NotInstalled;
+                }
+            }
             Task::none()
         }
         Message::ProtonPathSelected(path) => {
@@ -207,13 +289,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ProtonDownload => {
             let cancelled = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = tokio::sync::watch::channel(("Starting download...".to_string(), 0.0));
 
             state.proton_setup_active = true;
+            *state.proton_watch_rx.lock().unwrap() = Some(rx);
             state.proton_setup_progress = Some(("Starting download...".to_string(), 0.0));
 
             Task::perform(
                 async move {
-                    // Run the download in a blocking task
                     let cancelled_clone = cancelled.clone();
                     tokio::task::spawn_blocking(move || {
                         let result =
@@ -221,14 +304,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 if cancelled_clone.load(Ordering::SeqCst) {
                                     return;
                                 }
-                                // We can't send messages from here, so we'll handle it differently
-                                log::info!("Proton setup progress: {msg} ({:.0}%)", progress * 100.0);
+                                let _ = tx.send((msg.to_string(), progress));
                             });
                         result
                     })
                     .await
-                }
-                    ,
+                },
                 |result| match result {
                     Ok(Ok(path)) => Message::ProtonDownloadDone(Ok(path)),
                     Ok(Err(e)) => {
@@ -406,6 +487,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.setup_active = true;
             state.setup_progress.clear();
             state.setup_cancelled.store(false, Ordering::SeqCst);
+
+            // Mark selected tools as Installing on their cards
+            for tool in &selected_tools {
+                state.tool_statuses.insert(tool.slug.clone(), ToolStatus::Installing);
+            }
+
             state.log_messages.push(format!(
                 "Setting up {} tool(s)...",
                 selected_tools.len()
@@ -591,6 +678,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 },
             )
         }
+        Message::ToolStatusChecked { slug, installed } => {
+            let status = if installed {
+                ToolStatus::Installed
+            } else {
+                ToolStatus::NotInstalled
+            };
+            state.tool_statuses.insert(slug, status);
+            Task::none()
+        }
         Message::ToggleTool(slug) => {
             if state.config.tools.selected.contains(&slug) {
                 state.config.tools.selected.retain(|s| s != &slug);
@@ -616,6 +712,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SetupDone(results) => {
             state.setup_active = false;
             state.setup_progress = results.clone();
+            for result in &results {
+                let status = if result.success {
+                    ToolStatus::Installed
+                } else {
+                    ToolStatus::Broken
+                };
+                state.tool_statuses.insert(result.slug.clone(), status);
+            }
             let success_count = state.setup_progress.iter().filter(|r| r.success).count();
             let total = state.setup_progress.len();
             
@@ -873,76 +977,17 @@ fn view(state: &State) -> Element<'_, Message> {
         0
     };
 
-    let tool_list = if state.setup_active {
-        // Show setup progress instead of tool list
-        let mut children: Vec<Element<Message>> = Vec::new();
-
-        children.push(
-            text("Setting up tools...")
-                .size(16)
-                .style(|_: &iced::Theme| iced::widget::text::Style {
-                    color: Some(theme::FG),
-                })
-                .into()
-        );
-
-        for result in &state.setup_progress {
-            if result.success {
-                children.push(
-                    text(format!("✓ {}", result.name))
-                        .size(12)
-                        .style(|_: &iced::Theme| iced::widget::text::Style {
-                            color: Some(theme::MUTED),
-                        })
-                        .into()
-                );
-            } else {
-                let msg = if let Some(ref err) = result.error {
-                    format!("✗ {}: {}", result.name, err)
-                } else {
-                    format!("✗ {}", result.name)
-                };
-                children.push(
-                    text(msg)
-                        .size(12)
-                        .style(|_: &iced::Theme| iced::widget::text::Style {
-                            color: Some(theme::MUTED),
-                        })
-                        .into()
-                );
-            }
-        }
-
-        if state.setup_active {
-            children.push(
-                ghost_button("Cancel").on_press(Message::CancelSetup).into()
-            );
-        }
-
-        Column::with_children(children).into()
-    } else if let Some(manifest) = &state.manifest {
-        let setup_results = if state.setup_active {
-            Some(&state.setup_progress)
-        } else {
-            None
-        };
-        ui::tool_list(&manifest.tools, state.game_prefix_path.as_deref(), &state.config, selected_count, setup_results)
+    let tool_list = if let Some(manifest) = &state.manifest {
+        ui::tool_list(&manifest.tools, &state.config, selected_count, &state.tool_statuses)
     } else {
-        column![
-            text("Loading tools...")
-                .size(14)
-                .style(|_: &iced::Theme| iced::widget::text::Style {
-                    color: Some(theme::MUTED),
-                })
-        ]
-        .into()
+        // Should never happen — built-in manifest is always populated at boot
+        column![].into()
     };
 
-    // Footer buttons: Setup + Tools Dir + Launch/Re-launch
+    // Footer buttons: Setup/Cancel + Launch/Re-launch
     let footer_buttons = if state.setup_active {
         row![
-            setup_button(),
-            tools_dir_button(),
+            cancel_button(),
             launch_button(),
         ]
         .spacing(10)
@@ -950,14 +995,12 @@ fn view(state: &State) -> Element<'_, Message> {
         let launch_row = if state.game_launched {
             row![
                 setup_button(),
-                tools_dir_button(),
                 relaunch_button(),
             ]
             .spacing(10)
         } else {
             row![
                 setup_button(),
-                tools_dir_button(),
                 launch_button(),
             ]
             .spacing(10)
@@ -965,43 +1008,8 @@ fn view(state: &State) -> Element<'_, Message> {
         launch_row
     };
 
-    // Log panel
-    let log_panel = if state.log_visible {
-        let messages: Vec<_> = state
-            .log_messages
-            .iter()
-            .map(|m| Element::new(
-                text(m)
-                    .size(11)
-                    .style(|_: &iced::Theme| iced::widget::text::Style {
-                        color: Some(theme::MUTED),
-                    })
-            ))
-            .collect();
-        let log_content = column![
-            text("Log")
-                .size(12)
-                .style(|_: &iced::Theme| iced::widget::text::Style {
-                    color: Some(theme::FG),
-                }),
-            Column::with_children(messages),
-            ghost_button("Dismiss").on_press(Message::LogDismiss),
-        ]
-        .padding(12)
-        .spacing(4);
-
-        Some(
-            container(log_content)
-                .width(Length::Fill)
-                .height(Length::Shrink)
-                .style(|_: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(theme::LOG_BG)),
-                    ..iced::widget::container::Style::default()
-                })
-        )
-    } else {
-        None
-    };
+    // Log panel hidden from UI (logic kept for future use)
+    let log_panel: Option<Element<'_, Message>> = None;
 
     // Header
     let header = column![
@@ -1087,7 +1095,8 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
         .map(|(msg, p)| (msg.as_str(), *p))
         .unwrap_or(("Ready to install", 0.0));
 
-    let downloading = state.proton_setup_progress.is_some() && progress > 0.0;
+    let download_active = state.proton_setup_progress.is_some();
+    let downloading = download_active && progress > 0.0;
 
     let progress_bar: Element<'_, Message> = if downloading {
         Element::new(column![
@@ -1120,7 +1129,7 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
     };
 
     let download_section = column![
-        container(download_button()).width(200).align_x(iced::alignment::Horizontal::Center),
+        container(download_button(download_active, progress)).width(200).align_x(iced::alignment::Horizontal::Center),
         container(progress_bar).width(200).align_x(iced::alignment::Horizontal::Center),
     ]
     .spacing(8)
@@ -1172,13 +1181,21 @@ fn view_proton_setup(state: &State) -> Element<'_, Message> {
         .into()
 }
 
-fn download_button() -> iced::widget::Button<'static, Message> {
-    button(text("Download Proton"))
+fn download_button(downloading: bool, progress: f32) -> iced::widget::Button<'static, Message> {
+    let label = if downloading {
+        format!("Downloading {:.0}%", progress * 100.0)
+    } else {
+        "Download Proton".to_string()
+    };
+    let mut btn = button(text(label))
         .padding([12, 24])
-        .on_press(Message::ProtonDownload)
         .style(|_: &iced::Theme, status: iced::widget::button::Status| {
             button_primary_style(status)
-        })
+        });
+    if !downloading {
+        btn = btn.on_press(Message::ProtonDownload);
+    }
+    btn
 }
 
 fn custom_path_button() -> iced::widget::Button<'static, Message> {
@@ -1218,6 +1235,15 @@ fn setup_button() -> iced::widget::Button<'static, Message> {
         })
 }
 
+fn cancel_button() -> iced::widget::Button<'static, Message> {
+    button(text("Cancel"))
+        .padding(10)
+        .on_press(Message::CancelSetup)
+        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+            button_secondary_style(status)
+        })
+}
+
 fn launch_button() -> iced::widget::Button<'static, Message> {
     button(text("Launch"))
         .padding(10)
@@ -1236,14 +1262,15 @@ fn relaunch_button() -> iced::widget::Button<'static, Message> {
         })
 }
 
-fn tools_dir_button() -> iced::widget::Button<'static, Message> {
-    button(text("Tools Dir"))
-        .padding(10)
-        .on_press(Message::ToolsDirectory)
-        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
-            button_secondary_style(status)
-        })
-}
+// Kept for future use — logic in update() still handles Message::ToolsDirectory.
+// fn tools_dir_button() -> iced::widget::Button<'static, Message> {
+//     button(text("Tools Dir"))
+//         .padding(10)
+//         .on_press(Message::ToolsDirectory)
+//         .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+//             button_secondary_style(status)
+//         })
+// }
 
 fn button_secondary_style(status: iced::widget::button::Status) -> iced::widget::button::Style {
     let is_hovered = matches!(status, iced::widget::button::Status::Hovered);
@@ -1357,8 +1384,44 @@ fn subscription(state: &State) -> Subscription<Message> {
         })
     });
 
-    // 3. Window open events — capture the main window ID
+    // 3. Proton download progress watcher — polls the watch channel in a loop
+    let watcher = ProtonProgressWatcher(state.proton_watch_rx.clone());
+    let progress_events = Subscription::run_with(watcher, |data: &ProtonProgressWatcher| {
+        let rx = data.0.clone();
+        stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
+            let rx = rx.clone();
+            async move {
+                loop {
+                    // Wait until a receiver is available (user clicked Download)
+                    let mut receiver = loop {
+                        let opt = rx.lock().unwrap().clone();
+                        if let Some(r) = opt {
+                            break r;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    };
+
+                    // Process progress updates from this download
+                    loop {
+                        match receiver.changed().await {
+                            Ok(()) => {
+                                let (msg, progress) = receiver.borrow_and_update().clone();
+                                let _ = output.send(Message::ProtonDownloadProgress(msg, progress)).await;
+                            }
+                            Err(_) => {
+                                // Sender dropped — download finished or failed
+                                rx.lock().unwrap().take();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    });
+
+    // 4. Window open events — capture the main window ID
     let window_opens = window::open_events().map(Message::WindowOpened);
 
-    Subscription::batch(vec![close_events, tray_events, window_opens])
+    Subscription::batch(vec![close_events, tray_events, progress_events, window_opens])
 }

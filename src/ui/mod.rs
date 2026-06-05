@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::collections::HashMap;
 
 use iced::widget::{column as col, text};
 use iced::Element;
@@ -7,43 +7,17 @@ use crate::app::Message;
 use crate::config::Config;
 use crate::manifest::ToolEntry;
 use crate::theme;
-use crate::tools;
 use crate::ui::tool_card::ToolStatus;
 
 pub mod progress_bar;
 pub mod tool_card;
 
-/// Compute the display status for a tool.
-fn tool_status(
-    tool: &ToolEntry,
-    installed: bool,
-    setup_results: Option<&Vec<tools::ToolSetupResult>>,
-) -> ToolStatus {
-    // If we have setup results, use the latest result for this tool
-    if let Some(results) = setup_results {
-        if let Some(result) = results.iter().find(|r| r.slug == tool.slug) {
-            if result.success {
-                return ToolStatus::Installed;
-            } else {
-                return ToolStatus::Broken;
-            }
-        }
-    }
-
-    if installed {
-        ToolStatus::Installed
-    } else {
-        ToolStatus::NotInstalled
-    }
-}
-
 /// Build the main tool list UI.
 pub fn tool_list<'a>(
     tools: &'a [ToolEntry],
-    prefix_path: Option<&Path>,
     config: &'a Config,
     selected_count: usize,
-    setup_results: Option<&Vec<tools::ToolSetupResult>>,
+    tool_statuses: &HashMap<String, ToolStatus>,
 ) -> Element<'a, Message> {
     let mut children: Vec<Element<Message>> = Vec::new();
 
@@ -55,11 +29,10 @@ pub fn tool_list<'a>(
             continue;
         }
 
-        let installed = prefix_path
-            .map(|p| tools::is_installed(tool, p))
-            .unwrap_or(false);
-
-        let status = tool_status(tool, installed, setup_results);
+        let status = tool_statuses
+            .get(&tool.slug)
+            .copied()
+            .unwrap_or(ToolStatus::NotInstalled);
 
         children.push(tool_card::tool_card(
             tool,
