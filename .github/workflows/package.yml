@@ -3,7 +3,7 @@ name: Package
 
 on:
   workflow_dispatch:
-    intpus:
+    inputs:
       version:
         description: 'Version'
         required: false
