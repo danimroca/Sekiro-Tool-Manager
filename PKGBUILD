@@ -7,7 +7,7 @@ url="https://github.com/danimroca/Sekiro-Tool-Manager"
 license=('MIT')
 provides=('sekiro-launcher')
 conflicts=('sekiro-launcher')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/danimroca/Sekiro-Tool-Manager/releases/download/v${pkgver}/sekiro-launcher-x86_64-unknown-linux-gnu.tar.xz")
+source=("$pkgname-$pkgver.tar.xz::https://github.com/danimroca/Sekiro-Tool-Manager/releases/download/v${pkgver}/sekiro-launcher-x86_64-unknown-linux-gnu.tar.xz")
 sha256sums=('SKIP')
 
 package() {
