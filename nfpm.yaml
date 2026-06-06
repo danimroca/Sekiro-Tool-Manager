@@ -5,5 +5,5 @@ maintainer: Daniel danim.roca@mgial.com
 description: Sekiro launcher
 license: MIT
 contents:
-  - src: ./target/release/sekiro-launcher-iced
-    dst: /usr/bin/sekiro-launcher-iced
+  - src: ./target/release/sekiro-launcher
+    dst: /usr/bin/sekiro-launcher
