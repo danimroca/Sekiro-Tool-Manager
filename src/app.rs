@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, text, Column};
+use iced::widget::{button, column, container, pick_list, row, text};
 use iced::{stream, window, Border, Color, Element, Length, Subscription, Task};
 use iced::futures::SinkExt;
 
@@ -85,6 +85,9 @@ pub struct State {
     setup_progress: Vec<tools::ToolSetupResult>,
     setup_cancelled: Arc<AtomicBool>,
 
+    // Settings screen
+    settings_active: bool,
+
     // Game launch tracking
     game_launched: bool,
 
@@ -119,6 +122,20 @@ pub enum Message {
     ToolStatusChecked { slug: String, installed: bool },
     SetupDone(Vec<tools::ToolSetupResult>),
     LaunchBypass,
+    // Settings screen
+    Settings,
+    SettingsBack,
+    GameDirectoryAdd,
+    GameDirectoryAdded(PathBuf),
+    GameDirectoryAddName(String, PathBuf),
+    GameDirectoryRemove(String),
+    GameDirectoryRenameOld(String),
+    GameDirectoryRenameNew(String, String),
+    GameDirectorySelect(String),
+    GamePrefixSettingsSelect,
+    GamePrefixSettingsChosen(PathBuf),
+    ProtonSettingsSelect,
+    ProtonSettingsChosen(PathBuf),
     // Tray / window events
     CloseRequested,
     TrayShowRequested,
@@ -171,6 +188,7 @@ impl State {
                 setup_cancelled: Arc::new(AtomicBool::new(false)),
 
                 game_launched: false,
+                settings_active: false,
 
                 tray_rx,
 
@@ -261,6 +279,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.proton_setup_active = true;
             }
 
+            // If no game directories configured, show Settings screen
+            if state.config.game_directories.is_empty() {
+                state.settings_active = true;
+            }
+
             // If manifest is already loaded, spawn per-tool verification checks
             if let Some(manifest) = &state.manifest.clone() {
                 check_all_tools(state, &manifest.tools, &prefix)
@@ -278,6 +301,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 for (_, v) in state.tool_statuses.iter_mut() {
                     *v = ToolStatus::NotInstalled;
                 }
+            }
+            // Check first-run conditions even on fallback
+            if state.config.game_directories.is_empty() {
+                state.settings_active = true;
             }
             Task::none()
         }
@@ -367,14 +394,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ProtonPathSelect => {
-            // Show a directory chooser dialog via zenity
+            // Show a directory chooser dialog
             let cancelled = state.setup_cancelled.clone();
+            let initial = state.proton_path.clone();
             Task::perform(
                 tokio::task::spawn_blocking(move || {
                     if cancelled.load(Ordering::SeqCst) {
                         return Err("Cancelled".to_string());
                     }
-                    proton_setup::choose_proton_directory()
+                    proton_setup::choose_directory("Select Proton Installation", initial.as_deref())
                 }),
                 |result| match result {
                     Ok(Ok(path)) => Message::ProtonPathChosen(path),
@@ -417,12 +445,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::GamePrefixSelect => {
             // Show a directory chooser dialog for the game prefix
             let cancelled = state.setup_cancelled.clone();
+            let initial = state.game_prefix_path.clone();
             Task::perform(
                 tokio::task::spawn_blocking(move || {
                     if cancelled.load(Ordering::SeqCst) {
                         return Err("Cancelled".to_string());
                     }
-                    proton_setup::choose_directory("Select Sekiro Game Prefix", None)
+                    proton_setup::choose_directory("Select Sekiro Game Prefix", initial.as_deref())
                 }),
                 |result| match result {
                     Ok(Ok(path)) => Message::GamePrefixChosen(path),
@@ -601,6 +630,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let config = state.config.clone();
             let game_prefix_path = state.game_prefix_path.clone();
             let proton_path = state.config.proton.path.clone();
+            let game_dir = config.game_directories.selected_path();
             
             state.game_launched = true;
             
@@ -634,7 +664,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             }).collect();
 
                             // Step 1: Launch Sekiro via Proton bypass (no waitforexitandrun)
-                            if let Err(e) = crate::launch::launch_sekiro_bypass(&game_prefix, &proton_path) {
+                            if let Err(e) = crate::launch::launch_sekiro_bypass(&game_prefix, &proton_path, game_dir.as_deref()) {
                                 return Err(format!("Failed to launch Sekiro: {}", e));
                             }
 
@@ -677,6 +707,148 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 },
             )
+        }
+        Message::Settings => {
+            state.settings_active = true;
+            Task::none()
+        }
+        Message::SettingsBack => {
+            state.settings_active = false;
+            Task::none()
+        }
+        Message::GameDirectoryAdd => {
+            let initial = state.config.game_directories.selected_path();
+            Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    proton_setup::choose_directory("Select Sekiro Game Directory", initial.as_deref())
+                }),
+                |result| match result {
+                    Ok(Ok(path)) => Message::GameDirectoryAdded(path),
+                    Ok(Err(e)) => Message::LogPush(e),
+                    Err(e) => Message::LogPush(format!("Task failed: {e}")),
+                },
+            )
+        }
+        Message::GameDirectoryAdded(path) => {
+            let suggestion = path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    proton_setup::prompt_entry(
+                        "Game Directory",
+                        "Enter a name for this game directory:",
+                        &suggestion,
+                    )
+                }),
+                move |result| match result {
+                    Ok(Ok(name)) => Message::GameDirectoryAddName(name, path.clone()),
+                    Ok(Err(e)) => Message::LogPush(e),
+                    Err(e) => Message::LogPush(format!("Failed to get name: {e}")),
+                },
+            )
+        }
+        Message::GameDirectoryAddName(name, path) => {
+            state.config.game_directories.add(name, path);
+            let _ = state.config.save();
+            Task::none()
+        }
+        Message::GameDirectoryRemove(name) => {
+            state.config.game_directories.remove(&name);
+            let _ = state.config.save();
+            Task::none()
+        }
+        Message::GameDirectoryRenameOld(name) => {
+            let old_name = name.clone();
+            let initial = name;
+            Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    proton_setup::prompt_entry(
+                        "Rename Game Directory",
+                        "Enter a new name for this game directory:",
+                        &initial,
+                    )
+                }),
+                move |result| match result {
+                    Ok(Ok(new_name)) => Message::GameDirectoryRenameNew(old_name, new_name),
+                    Ok(Err(e)) => Message::LogPush(e),
+                    Err(e) => Message::LogPush(format!("Failed to get name: {e}")),
+                },
+            )
+        }
+        Message::GameDirectoryRenameNew(old_name, new_name) => {
+            let new_name = new_name.trim().to_string();
+            if !new_name.is_empty() && new_name != old_name {
+                state.config.game_directories.rename(&old_name, &new_name);
+                let _ = state.config.save();
+            }
+            Task::none()
+        }
+        Message::GameDirectorySelect(name) => {
+            state.config.game_directories.selected = Some(name);
+            let _ = state.config.save();
+            Task::none()
+        }
+        Message::GamePrefixSettingsSelect => {
+            let cancelled = state.setup_cancelled.clone();
+            let initial = state.game_prefix_path.clone();
+            Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err("Cancelled".to_string());
+                    }
+                    proton_setup::choose_directory("Select Sekiro Game Prefix", initial.as_deref())
+                }),
+                |result| match result {
+                    Ok(Ok(path)) => Message::GamePrefixSettingsChosen(path),
+                    Ok(Err(e)) => Message::LogPush(e),
+                    Err(e) => Message::LogPush(format!("Failed to choose directory: {e}")),
+                },
+            )
+        }
+        Message::GamePrefixSettingsChosen(path) => {
+            if path.is_dir() {
+                state.game_prefix_path = Some(path.clone());
+                state.config.game_prefix.path = Some(path.to_string_lossy().to_string());
+                let _ = state.config.save();
+                state.log_messages.push("Game prefix set successfully!".to_string());
+                state.log_visible = true;
+            }
+            Task::none()
+        }
+        Message::ProtonSettingsSelect => {
+            let cancelled = state.setup_cancelled.clone();
+            let initial = state.proton_path.clone();
+            Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err("Cancelled".to_string());
+                    }
+                    proton_setup::choose_directory("Select Proton Installation", initial.as_deref())
+                }),
+                |result| match result {
+                    Ok(Ok(path)) => Message::ProtonSettingsChosen(path),
+                    Ok(Err(e)) => Message::LogPush(e),
+                    Err(e) => Message::LogPush(format!("Failed to choose directory: {e}")),
+                },
+            )
+        }
+        Message::ProtonSettingsChosen(path) => {
+            match proton_setup::verify_proton_installation(&path) {
+                Ok(()) => {
+                    state.proton_path = Some(path.clone());
+                    state.config.proton.path = Some(path.to_string_lossy().to_string());
+                    let _ = state.config.save();
+                    state.log_messages.push("Proton path set successfully!".to_string());
+                    state.log_visible = true;
+                }
+                Err(e) => {
+                    state.log_messages.push(format!("Invalid Proton installation: {e}"));
+                    state.log_visible = true;
+                }
+            }
+            Task::none()
         }
         Message::ToolStatusChecked { slug, installed } => {
             let status = if installed {
@@ -769,13 +941,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             let game_prefix = state.game_prefix_path.clone();
             let proton_path = state.config.proton.path.clone();
+            let game_dir = state.config.game_directories.selected_path();
 
             Task::perform(
                 async move {
                     match game_prefix {
                         Some(prefix) => {
-                            // proton_path is &Option<String> — pass it directly
-                            crate::launch::launch_sekiro_bypass(&prefix, &proton_path)
+                            crate::launch::launch_sekiro_bypass(&prefix, &proton_path, game_dir.as_deref())
                                 .map_err(|e| format!("Failed to launch Sekiro: {e}"))
                         }
                         None => {
@@ -968,6 +1140,16 @@ fn view(state: &State) -> Element<'_, Message> {
         return view_proton_setup(state);
     }
 
+    // If settings is active, show the settings screen
+    if state.settings_active {
+        return view_settings(state);
+    }
+
+    view_main(state)
+}
+
+/// Main view: header, game directory dropdown, tool list, footer with Setup/Launch + Settings.
+fn view_main(state: &State) -> Element<'_, Message> {
     // Count selected tools
     let selected_count = if let Some(manifest) = &state.manifest {
         manifest.tools.iter().filter(|t| {
@@ -980,15 +1162,17 @@ fn view(state: &State) -> Element<'_, Message> {
     let tool_list = if let Some(manifest) = &state.manifest {
         ui::tool_list(&manifest.tools, &state.config, selected_count, &state.tool_statuses)
     } else {
-        // Should never happen — built-in manifest is always populated at boot
         column![].into()
     };
 
-    // Footer buttons: Setup/Cancel + Launch/Re-launch
+    // Footer buttons: Setup/Cancel + Launch/Re-launch, Settings aligned right
     let footer_buttons = if state.setup_active {
         row![
             cancel_button(),
             launch_button(),
+            iced::widget::Space::new().width(Length::Fill),
+            ghost_button("Settings")
+                .on_press(Message::Settings),
         ]
         .spacing(10)
     } else {
@@ -1005,13 +1189,19 @@ fn view(state: &State) -> Element<'_, Message> {
             ]
             .spacing(10)
         };
-        launch_row
+        row![
+            launch_row,
+            iced::widget::Space::new().width(Length::Fill),
+            ghost_button("Settings")
+                .on_press(Message::Settings),
+        ]
+        .spacing(10)
     };
 
     // Log panel hidden from UI (logic kept for future use)
     let log_panel: Option<Element<'_, Message>> = None;
 
-    // Header
+    // Header with title and subtitle
     let header = column![
         text("Sekiro Tools")
             .size(22)
@@ -1023,51 +1213,60 @@ fn view(state: &State) -> Element<'_, Message> {
             .style(|_: &iced::Theme| iced::widget::text::Style {
                 color: Some(theme::MUTED),
             }),
-    ]
-    .spacing(6);
+    ].spacing(6);
 
-   // Configuration section
-    let game_prefix_path_str = state.game_prefix_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| crate::config::GamePrefixConfig::default_path().to_string_lossy().to_string());
+    // Game directory dropdown
+    let game_dir_names: Vec<String> = state.config.game_directories.directories
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
 
-    let config_content = column![
+    let dropdown: Element<'_, Message> = if game_dir_names.is_empty() {
+        Element::new(
+            text("No game directories configured")
+                .size(13)
+                .style(|_: &iced::Theme| iced::widget::text::Style {
+                    color: Some(theme::MUTED),
+                })
+        )
+    } else {
+        Element::new(
+            pick_list(
+                game_dir_names,
+                state.config.game_directories.selected.clone(),
+                Message::GameDirectorySelect,
+            )
+            .text_size(13)
+            .width(Length::Fill)
+        )
+    };
+
+    let game_dir_section = container(
         row![
-            text("Game Prefix:")
+            text("Game:")
                 .size(13)
                 .style(|_: &iced::Theme| iced::widget::text::Style {
                     color: Some(theme::FG),
                 }),
-            text(game_prefix_path_str)
-                .size(12)
-                .style(|_: &iced::Theme| iced::widget::text::Style {
-                    color: Some(theme::MUTED),
-                })
-                .width(Length::Fill),
-            ghost_button("Change")
-                .on_press(Message::GamePrefixSelect)
+            dropdown,
         ]
         .spacing(10)
-        .align_y(iced::alignment::Vertical::Center),
-    ]
-    .spacing(4)
-    .padding(12);
-
-    let config_section = container(config_content)
-        .style(|_: &iced::Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::SURFACE)),
-            border: Border {
-                color: Color::from_rgb(0.2, 0.2, 0.25),
-                radius: 8.0.into(),
-                width: 1.0,
-            },
-            ..iced::widget::container::Style::default()
-        });
+        .align_y(iced::alignment::Vertical::Center)
+    )
+    .padding(12)
+    .style(|_: &iced::Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::SURFACE)),
+        border: Border {
+            color: Color::from_rgb(0.2, 0.2, 0.25),
+            radius: 8.0.into(),
+            width: 1.0,
+        },
+        ..iced::widget::container::Style::default()
+    });
 
     let content = column![
         header,
-        config_section,
+        game_dir_section,
         tool_list,
         footer_buttons,
     ]
@@ -1087,6 +1286,204 @@ fn view(state: &State) -> Element<'_, Message> {
     } else {
         content.into()
     }
+}
+
+/// Settings view: back button, three config cards.
+fn view_settings(state: &State) -> Element<'_, Message> {
+    // Title row (stays alone at top)
+    let title_row = text("Settings")
+        .size(22)
+        .style(|_: &iced::Theme| iced::widget::text::Style {
+            color: Some(theme::FG),
+        });
+
+    // Back button — styled like primary action buttons (red)
+    let back_button = button(text("← Back"))
+        .padding(10)
+        .on_press(Message::SettingsBack)
+        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+            button_primary_style(status)
+        });
+
+    // --- Game Prefix card ---
+    let game_prefix_str = state.game_prefix_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| crate::config::GamePrefixConfig::default_path().to_string_lossy().to_string());
+
+    let prefix_card = {
+        let prefix_content = row![
+            column![
+                text("Game Prefix")
+                    .size(15)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::FG),
+                    }),
+                text(game_prefix_str)
+                    .size(12)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::MUTED),
+                    })
+                    .width(Length::Fill),
+            ].spacing(4).width(Length::Fill),
+            ghost_button("Change")
+                .on_press(Message::GamePrefixSettingsSelect),
+        ]
+        .spacing(10)
+        .align_y(iced::alignment::Vertical::Center);
+
+        container(prefix_content)
+            .padding(16)
+            .width(Length::Fill)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::SURFACE)),
+                border: Border {
+                    color: Color::from_rgb(0.2, 0.2, 0.25),
+                    radius: 8.0.into(),
+                    width: 1.0,
+                },
+                ..iced::widget::container::Style::default()
+            })
+    };
+
+    // --- Game Directories card ---
+    let mut dir_list_items: Vec<Element<'_, Message>> = Vec::new();
+    for dir in &state.config.game_directories.directories {
+        let remove_btn = button(text("×"))
+            .padding([2, 8])
+            .on_press(Message::GameDirectoryRemove(dir.name.clone()))
+            .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+                button_ghost_style(status)
+            });
+
+        let rename_btn = button(text("✎"))
+            .padding([2, 8])
+            .on_press(Message::GameDirectoryRenameOld(dir.name.clone()))
+            .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+                button_ghost_style(status)
+            });
+
+        let item = row![
+            column![
+                text(&dir.name)
+                    .size(13)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::FG),
+                    }),
+                text(&dir.path)
+                    .size(11)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::MUTED),
+                    }),
+            ].spacing(2).width(Length::Fill),
+            rename_btn,
+            remove_btn,
+        ]
+        .align_y(iced::alignment::Vertical::Center)
+        .padding([8, 12]);
+
+        dir_list_items.push(
+            container(item)
+                .style(|_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(theme::SURFACE2)),
+                    border: Border {
+                        color: Color::from_rgb(0.2, 0.2, 0.25),
+                        radius: 4.0.into(),
+                        width: 1.0,
+                    },
+                    ..iced::widget::container::Style::default()
+                })
+                .into()
+        );
+    }
+
+    let add_game_btn = ghost_button("Add Game")
+        .on_press(Message::GameDirectoryAdd);
+
+    let dir_content = column![
+        text("Game Directories")
+            .size(15)
+            .style(|_: &iced::Theme| iced::widget::text::Style {
+                color: Some(theme::FG),
+            }),
+        column(dir_list_items).spacing(8),
+        add_game_btn,
+    ]
+    .spacing(10);
+
+    let dir_card = container(dir_content)
+        .padding(16)
+        .width(Length::Fill)
+        .style(|_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::SURFACE)),
+            border: Border {
+                color: Color::from_rgb(0.2, 0.2, 0.25),
+                radius: 8.0.into(),
+                width: 1.0,
+            },
+            ..iced::widget::container::Style::default()
+        });
+
+    // --- Proton Directory card ---
+    let proton_str = state.proton_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Not configured".to_string());
+
+    let proton_card = {
+        let proton_content = row![
+            column![
+                text("Proton Directory")
+                    .size(15)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::FG),
+                    }),
+                text(proton_str)
+                    .size(12)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::MUTED),
+                    })
+                    .width(Length::Fill),
+            ].spacing(4).width(Length::Fill),
+            ghost_button("Change")
+                .on_press(Message::ProtonSettingsSelect),
+        ]
+        .spacing(10)
+        .align_y(iced::alignment::Vertical::Center);
+
+        container(proton_content)
+            .padding(16)
+            .width(Length::Fill)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::SURFACE)),
+                border: Border {
+                    color: Color::from_rgb(0.2, 0.2, 0.25),
+                    radius: 8.0.into(),
+                    width: 1.0,
+                },
+                ..iced::widget::container::Style::default()
+            })
+    };
+
+    let content = column![
+        title_row,
+        prefix_card,
+        dir_card,
+        proton_card,
+        back_button,
+    ]
+    .spacing(16)
+    .padding(24);
+
+    let base = container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::BG)),
+            ..iced::widget::container::Style::default()
+        });
+
+    base.into()
 }
 
 /// View for the proton setup screen.
@@ -1321,20 +1718,24 @@ fn button_ghost_style(status: iced::widget::button::Status) -> iced::widget::but
     let is_hovered = matches!(status, iced::widget::button::Status::Hovered);
 
     iced::widget::button::Style {
-        background: Some(iced::Background::Color(Color::TRANSPARENT)),
+        background: Some(iced::Background::Color(if is_hovered {
+            theme::SURFACE2
+        } else {
+            theme::SURFACE
+        })),
         border: Border {
             color: if is_hovered {
                 theme::BTN_BORDER_HOVER
             } else {
-                theme::BTN_BORDER
+                theme::CARD_BORDER
             },
             radius: 6.0.into(),
             width: 1.0,
         },
         text_color: if is_hovered {
-            theme::FG
+            theme::ACCENT
         } else {
-            theme::MUTED
+            theme::FG
         },
         ..iced::widget::button::Style::default()
     }

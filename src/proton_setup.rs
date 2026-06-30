@@ -234,58 +234,148 @@ pub fn verify_proton_installation(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a directory chooser dialog using zenity and return the selected path.
-/// This is a blocking call — zenity stays open until the user confirms or cancels.
-pub fn choose_directory(title: &str, initial_path: Option<&Path>) -> Result<PathBuf, String> {
-    let mut cmd = Command::new("zenity");
-    cmd.args(["--file-selection", "--directory"]);
-    
-    if !title.is_empty() {
-        cmd.arg("--title").arg(title);
-    }
-    
-    if let Some(path) = initial_path {
-        if path.exists() {
-            cmd.arg("--filename").arg(path);
-        }
-    }
-
-    let output = cmd.output()
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                "zenity not found. Please install zenity or choose the directory manually.".to_string()
-            } else {
-                format!("Failed to launch zenity: {e}")
+/// Open a text entry dialog and return the entered string.
+/// - `title`: window title
+/// - `instruction`: label shown above the entry field
+/// - `initial_text`: optional pre-filled text (yad only; zenity ignores it)
+/// Tries `yad` first (preferred), falls back to `zenity`.
+pub fn prompt_entry(title: &str, instruction: &str, initial_text: &str) -> Result<String, String> {
+    let try_cmd = |bin: &str| -> Result<String, String> {
+        let mut cmd = Command::new(bin);
+        match bin {
+            "yad" => {
+                cmd.args(["--entry", "--width=400"]);
+                if !initial_text.is_empty() {
+                    cmd.arg("--entry-text").arg(initial_text);
+                }
             }
+            _ => {
+                cmd.args(["--entry", "--width", "400"]);
+            }
+        }
+
+        if !title.is_empty() {
+            cmd.arg("--title").arg(title);
+        }
+
+        if !instruction.is_empty() {
+            cmd.arg("--text").arg(instruction);
+        }
+
+        let output = cmd.output().map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return format!("{bin} not found");
+            }
+            format!("Failed to launch {bin}: {e}")
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Exit code 1 means user cancelled
-        if output.status.code() == Some(1) {
-            return Err("Cancelled".to_string());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(1) {
+                return Err("Cancelled".to_string());
+            }
+            return Err(format!("{bin} exited with error: {stderr}"));
         }
-        return Err(format!("zenity exited with error: {stderr}"));
-    }
 
-    // stdout contains the selected path
-    let path_str = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+        let entry = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if entry.is_empty() {
+            return Err("No name entered".to_string());
+        }
 
-    if path_str.is_empty() {
-        return Err("No path selected".to_string());
-    }
+        Ok(entry)
+    };
 
-    let path = PathBuf::from(path_str);
-    if !path.is_dir() {
-        return Err(format!("Selected path is not a directory: {path:?}"));
-    }
-
-    Ok(path)
+    try_cmd("yad").or_else(|e| {
+        if e == "yad not found" {
+            try_cmd("zenity").map_err(|e| {
+                if e == "zenity not found" {
+                    "No dialog tool available. Please install yad or zenity.".to_string()
+                } else {
+                    e
+                }
+            })
+        } else {
+            Err(e)
+        }
+    })
 }
 
-/// Open a directory chooser dialog using zenity for Proton selection.
+/// Run a directory chooser dialog, trying `yad` first (preferred), falling back to `zenity`.
+/// Returns the selected path or an error (including "Cancelled" if the user cancelled).
+fn run_directory_chooser(title: &str, initial_path: Option<&Path>) -> Result<PathBuf, String> {
+    let try_cmd = |bin: &str| -> Result<PathBuf, String> {
+        let mut cmd = Command::new(bin);
+        // yad uses --file, zenity uses --file-selection
+        if bin == "yad" {
+            cmd.args(["--file", "--directory"]);
+        } else {
+            cmd.args(["--file-selection", "--directory"]);
+        }
+
+        if !title.is_empty() {
+            cmd.arg("--title").arg(title);
+        }
+
+        if let Some(path) = initial_path {
+            if path.exists() {
+                cmd.arg("--filename").arg(path);
+            }
+        }
+
+        let output = cmd.output().map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return format!("{bin} not found");
+            }
+            format!("Failed to launch {bin}: {e}")
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(1) {
+                return Err("Cancelled".to_string());
+            }
+            return Err(format!("{bin} exited with error: {stderr}"));
+        }
+
+        let path_str = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_string();
+
+        if path_str.is_empty() {
+            return Err("No path selected".to_string());
+        }
+
+        let path = PathBuf::from(path_str);
+        if !path.is_dir() {
+            return Err(format!("Selected path is not a directory: {path:?}"));
+        }
+
+        Ok(path)
+    };
+
+    try_cmd("yad").or_else(|e| {
+        if e == "yad not found" {
+            try_cmd("zenity")
+        } else {
+            Err(e)
+        }
+    })
+}
+
+/// Open a directory chooser dialog and return the selected path.
+/// This is a blocking call — the dialog stays open until the user confirms or cancels.
+pub fn choose_directory(title: &str, initial_path: Option<&Path>) -> Result<PathBuf, String> {
+    run_directory_chooser(title, initial_path)
+        .map_err(|e| {
+            if e == "zenity not found" {
+                "No directory chooser available. Please install yad or zenity.".to_string()
+            } else {
+                e
+            }
+        })
+}
+
+/// Open a directory chooser dialog for Proton selection.
 pub fn choose_proton_directory() -> Result<PathBuf, String> {
     choose_directory("Select Proton Installation", None)
 }

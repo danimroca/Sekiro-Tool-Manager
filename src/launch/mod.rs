@@ -440,15 +440,19 @@ fn parse_manifest_install_dir(content: &str) -> Option<String> {
 pub fn launch_sekiro_bypass(
     prefix_path: &Path,
     proton_path: &Option<String>,
+    game_dir_override: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
   // Don't kill anything — the direct Proton launch below bypasses Steam entirely,
     // so Steam's "game is running" check is never triggered.
 
     // Direct Proton launch — bypasses Steam entirely to avoid
     // Steam's "game is running" check that blocks re-launch.
-    let game_dir = find_sekiro_game_dir()
+    let game_dir = game_dir_override
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_path_buf())
+        .or_else(|| find_sekiro_game_dir())
         .ok_or_else(|| anyhow::anyhow!(
-            "Could not find Sekiro game directory. Make sure Sekiro is installed via Steam."
+            "Could not find Sekiro game directory. Make sure Sekiro is installed via Steam, or configure a game directory in Settings."
         ))?;
 
     // Try the Linux launcher script first (sekiro.sh), then the Windows exe
