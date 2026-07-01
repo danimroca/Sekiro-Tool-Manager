@@ -224,3 +224,53 @@ fn button_toggle_style(
         ..iced::widget::button::Style::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_status_label_all_variants() {
+        for status in &[
+            ToolStatus::Installed,
+            ToolStatus::NotInstalled,
+            ToolStatus::Broken,
+            ToolStatus::Checking,
+            ToolStatus::Installing,
+        ] {
+            assert!(!status.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_status_text_color_all_variants() {
+        for status in &[
+            ToolStatus::Installed,
+            ToolStatus::NotInstalled,
+            ToolStatus::Broken,
+            ToolStatus::Checking,
+            ToolStatus::Installing,
+        ] {
+            let _ = status.text_color();
+        }
+    }
+
+    #[test]
+    fn tool_status_bg_color_all_variants() {
+        for status in &[
+            ToolStatus::Installed,
+            ToolStatus::NotInstalled,
+            ToolStatus::Broken,
+            ToolStatus::Checking,
+            ToolStatus::Installing,
+        ] {
+            let _ = status.bg_color();
+        }
+    }
+
+    #[test]
+    fn tool_status_equality() {
+        assert_eq!(ToolStatus::Installed, ToolStatus::Installed);
+        assert_ne!(ToolStatus::Installed, ToolStatus::NotInstalled);
+    }
+}

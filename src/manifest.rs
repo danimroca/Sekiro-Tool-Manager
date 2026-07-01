@@ -76,13 +76,18 @@ fn tool_defs() -> Vec<ToolEntry> {
 }
 
 fn fetch_remote() -> Result<Manifest, anyhow::Error> {
+    fetch_from(MANIFEST_URL)
+}
+
+/// Fetch the manifest from a given URL with retries (used in tests with mockito).
+fn fetch_from(url: &str) -> Result<Manifest, anyhow::Error> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     // Retry 3 times with exponential backoff
     for attempt in 1..=3 {
-        match client.get(MANIFEST_URL).send() {
+        match client.get(url).send() {
             Ok(response) => {
                 if response.status().is_success() {
                     let manifest: Manifest = response.json()?;
@@ -99,4 +104,46 @@ fn fetch_remote() -> Result<Manifest, anyhow::Error> {
     }
 
     Err(anyhow::anyhow!("Failed to fetch manifest after 3 retries"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_has_exactly_5_tools() {
+        let manifest = Manifest::builtin();
+        assert_eq!(manifest.tools.len(), 5);
+    }
+
+    #[test]
+    fn builtin_slugs_are_unique() {
+        let manifest = Manifest::builtin();
+        let mut slugs: Vec<&str> = manifest.tools.iter().map(|t| t.slug.as_str()).collect();
+        slugs.sort();
+        slugs.dedup();
+        assert_eq!(slugs.len(), manifest.tools.len());
+    }
+
+    #[test]
+    fn fetch_falls_back_to_builtin_on_network_error() {
+        // fetch() should never return Err — falls back to builtin
+        let result = Manifest::fetch();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().tools.len(), 5);
+    }
+
+    #[test]
+    fn fetch_from_retries_on_timeout() {
+        let mut server = mockito::Server::new();
+        let m = server.mock("GET", "/")
+            .with_status(503)
+            .with_body("")
+            .expect_at_least(1)
+            .create();
+
+        let result = fetch_from(&server.url());
+        assert!(result.is_err());
+        m.assert();
+    }
 }

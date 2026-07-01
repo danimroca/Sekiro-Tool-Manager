@@ -14,3 +14,16 @@ pub enum ToastLevel {
     Success,
     Error,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_level_derives_clone_copy_partial_eq() {
+        let a = ToastLevel::Info;
+        let b = a;
+        assert_eq!(a, b);
+        assert!(ToastLevel::Info != ToastLevel::Error);
+    }
+}

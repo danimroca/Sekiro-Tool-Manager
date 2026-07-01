@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const APP_DIR: &str = ".config/sekiro-launcher";
 const CONFIG_FILE: &str = "config.toml";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub proton: ProtonConfig,
     pub game_prefix: GamePrefixConfig,
@@ -12,12 +12,12 @@ pub struct Config {
     pub tools: ToolsConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProtonConfig {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GamePrefixConfig {
     pub path: Option<String>,
 }
@@ -49,13 +49,13 @@ impl GamePrefixConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GameDirectory {
     pub name: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GameDirectoriesConfig {
     pub directories: Vec<GameDirectory>,
     pub selected: Option<String>,
@@ -123,7 +123,7 @@ impl ProtonConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolsConfig {
     pub selected: Vec<String>,
     pub visible: Vec<String>,
@@ -139,7 +139,15 @@ impl Config {
     }
 
     pub fn load() -> Result<Self, anyhow::Error> {
-        let path = Self::default_path();
+        Self::load_from(&Self::default_path())
+    }
+
+    pub fn save(&self) -> Result<(), anyhow::Error> {
+        self.save_to(&Self::default_path())
+    }
+
+    /// Load config from an explicit path (used in tests).
+    pub fn load_from(path: &Path) -> Result<Self, anyhow::Error> {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             // Try full parse first. If it fails (e.g. missing new fields added in newer
@@ -193,13 +201,102 @@ impl Config {
         }
     }
 
-    pub fn save(&self) -> Result<(), anyhow::Error> {
-        let path = Self::default_path();
+    /// Save config to an explicit path (used in tests).
+    pub fn save_to(&self, path: &Path) -> Result<(), anyhow::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        std::fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_returns_default_when_no_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn load_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = Config {
+            proton: ProtonConfig { path: Some("/test/proton".into()) },
+            game_prefix: GamePrefixConfig { path: Some("/test/prefix".into()) },
+            tools: ToolsConfig {
+                selected: vec!["livesplit".into()],
+                visible: vec![],
+            },
+            ..Config::default()
+        };
+        original.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(original, loaded);
+    }
+
+    #[test]
+    fn load_merges_partial_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, r#"[proton]
+path = "/custom/proton"
+"#).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.proton.path, Some("/custom/proton".into()));
+        assert_eq!(config.tools, ToolsConfig::default());
+    }
+
+    #[test]
+    fn save_creates_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("sub/deep/config.toml");
+        let config = Config::default();
+        config.save_to(&nested).unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn game_directories_add_auto_selects_first() {
+        let mut gdc = GameDirectoriesConfig::default();
+        assert!(gdc.selected.is_none());
+        gdc.add("game1".into(), PathBuf::from("/games/1"));
+        assert_eq!(gdc.selected.as_deref(), Some("game1"));
+    }
+
+    #[test]
+    fn game_directories_remove_reselects() {
+        let mut gdc = GameDirectoriesConfig::default();
+        gdc.add("a".into(), PathBuf::from("/a"));
+        gdc.add("b".into(), PathBuf::from("/b"));
+        gdc.selected = Some("a".into());
+        gdc.remove("a");
+        assert_eq!(gdc.selected.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn game_directories_rename_updates_selection() {
+        let mut gdc = GameDirectoriesConfig::default();
+        gdc.add("old".into(), PathBuf::from("/path"));
+        gdc.rename("old", "new");
+        assert_eq!(gdc.selected.as_deref(), Some("new"));
+        assert_eq!(gdc.directories[0].name, "new");
+    }
+
+    #[test]
+    fn game_directories_is_empty() {
+        let gdc = GameDirectoriesConfig::default();
+        assert!(gdc.is_empty());
+        let mut gdc = GameDirectoriesConfig::default();
+        gdc.add("x".into(), PathBuf::from("/x"));
+        assert!(!gdc.is_empty());
     }
 }
