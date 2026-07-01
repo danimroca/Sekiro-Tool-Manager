@@ -158,12 +158,18 @@ pub fn setup_tool(
 
 /// Fetch the latest release info from GitHub API.
 fn fetch_latest_release(repo: &str) -> Result<GitHubRelease, String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let client = reqwest::blocking::Client::builder()
         .user_agent("sekiro-launcher")
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    fetch_latest_release_with_client(&client, repo)
+}
+
+/// Fetch latest release using a provided client (used in tests with mockito).
+fn fetch_latest_release_with_client(client: &reqwest::blocking::Client, repo: &str) -> Result<GitHubRelease, String> {
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
 
     let resp = client
         .get(&url)
@@ -189,43 +195,51 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
 
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
-        }
-
         let client = reqwest::blocking::Client::builder()
             .user_agent("sekiro-launcher")
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-        let resp = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("Download failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            last_err = format!("HTTP {status} for {url}");
-            if attempt < 2 {
-                log::debug!("Download attempt {} failed for {}: {}", attempt + 1, dest.display(), last_err);
+        match download_file_with_client(&client, url, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt < 2 {
+                    log::debug!("Download attempt {} failed for {}: {}", attempt + 1, dest.display(), last_err);
+                }
             }
-            continue;
         }
-
-        let bytes = resp
-            .bytes()
-            .map_err(|e| format!("Failed to read response: {e}"))?;
-
-        let mut file = File::create(dest).map_err(|e| format!("Failed to create file: {e}"))?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("Failed to write file: {e}"))?;
-
-        log::debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
-        return Ok(());
     }
 
     Err(format!("Failed after 3 attempts: {last_err}"))
+}
+
+/// Download a file using a provided client (used in tests with mockito).
+fn download_file_with_client(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
+    }
+
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for {}", resp.status(), url));
+    }
+
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("Failed to read response: {e}"))?;
+
+    let mut file = File::create(dest).map_err(|e| format!("Failed to create file: {e}"))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("Failed to write file: {e}"))?;
+
+    log::debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
+    Ok(())
 }
 
 /// Extract a zip archive to a destination directory.
@@ -354,6 +368,190 @@ fn find_exec_recursive(base: &Path, dir: &Path, results: &mut Vec<PathBuf>) {
 /// Uses a marker file at `<prefix>/.dotnet_desktop_installed`.
 pub fn is_dotnet_desktop_installed(prefix_path: &Path) -> bool {
     prefix_path.join(".dotnet_desktop_installed").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::io::Write;
+
+    #[test]
+    fn tool_install_dir_constructs_correct_path() {
+        let tool = ToolEntry {
+            name: "Test".into(),
+            slug: "test-tool".into(),
+            github_repo: "user/repo".into(),
+            description: "desc".into(),
+        };
+        let prefix = Path::new("/some/prefix");
+        let dir = tool_install_dir(&tool, prefix);
+        assert_eq!(dir, Path::new("/some/prefix/drive_c/tools/test-tool"));
+    }
+
+    #[test]
+    fn has_tool_files_returns_false_when_missing() {
+        let dir = tempdir().unwrap();
+        assert!(!has_tool_files(dir.path().join("nonexistent").as_path()));
+    }
+
+    #[test]
+    fn has_tool_files_returns_true_when_executable_found() {
+        let dir = tempdir().unwrap();
+        File::create(dir.path().join("tool.exe")).unwrap();
+        assert!(has_tool_files(dir.path()));
+    }
+
+    #[test]
+    fn has_tool_files_returns_false_with_no_executable() {
+        let dir = tempdir().unwrap();
+        File::create(dir.path().join("readme.txt")).unwrap();
+        assert!(!has_tool_files(dir.path()));
+    }
+
+    #[test]
+    fn find_executable_prefers_exe_over_jar() {
+        let dir = tempdir().unwrap();
+        File::create(dir.path().join("tool.jar")).unwrap();
+        File::create(dir.path().join("tool.exe")).unwrap();
+        let result = find_executable(dir.path());
+        assert_eq!(result, Some(PathBuf::from("tool.exe")));
+    }
+
+    #[test]
+    fn find_executable_skips_components_dir() {
+        let dir = tempdir().unwrap();
+        let comp_dir = dir.path().join("Components");
+        fs::create_dir_all(&comp_dir).unwrap();
+        File::create(comp_dir.join("helper.exe")).unwrap();
+        File::create(dir.path().join("main.exe")).unwrap();
+        let result = find_executable(dir.path());
+        assert_eq!(result, Some(PathBuf::from("main.exe")));
+    }
+
+    #[test]
+    fn find_executable_returns_none_on_empty_dir() {
+        let dir = tempdir().unwrap();
+        let result = find_executable(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_exec_recursive_skips_jre_and_git() {
+        let dir = tempdir().unwrap();
+        let jre = dir.path().join("jre");
+        let git = dir.path().join(".git");
+        let macosx = dir.path().join("__MACOSX");
+        for d in [&jre, &git, &macosx] {
+            fs::create_dir_all(d).unwrap();
+            File::create(d.join("ignored.exe")).unwrap();
+        }
+        // Place a real exe at root
+        File::create(dir.path().join("real.exe")).unwrap();
+
+        let mut results = Vec::new();
+        find_exec_recursive(dir.path(), dir.path(), &mut results);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], PathBuf::from("real.exe"));
+    }
+
+    #[test]
+    fn copy_dir_all_copies_recursively() {
+        let src = tempdir().unwrap();
+        let sub = src.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        File::create(src.path().join("a.txt")).unwrap();
+        File::create(sub.join("b.txt")).unwrap();
+
+        let dst = tempdir().unwrap().path().join("copied");
+        copy_dir_all(src.path(), &dst).unwrap();
+
+        assert!(dst.join("a.txt").exists());
+        assert!(dst.join("sub/b.txt").exists());
+    }
+
+    #[test]
+    fn extract_zip_extracts_contents() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+
+        // Create a minimal zip in memory
+        let zip_file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        zip_writer.start_file("hello.txt", zip::write::FileOptions::<()>::default()).unwrap();
+        zip_writer.write_all(b"hello world").unwrap();
+        zip_writer.finish().unwrap();
+
+        let dest = dir.path().join("extracted");
+        extract_zip(&zip_path, &dest).unwrap();
+
+        assert!(dest.join("hello.txt").exists());
+        assert_eq!(std::fs::read_to_string(dest.join("hello.txt")).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn extract_tar_gz_extracts_contents() {
+        let dir = tempdir().unwrap();
+        let tar_path = dir.path().join("test.tar.gz");
+
+        // Create a tar.gz in memory
+        let file = std::fs::File::create(&tar_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar_writer = tar::Builder::new(encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path("hello.txt").unwrap();
+        header.set_size(12);
+        header.set_cksum();
+        tar_writer.append(&header, "hello world\n".as_bytes()).unwrap();
+
+        let encoder = tar_writer.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let dest = dir.path().join("extracted");
+        extract_tar_gz(&tar_path, &dest).unwrap();
+
+        assert!(dest.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn extract_zip_handles_dirs_inside_archive() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("nested.zip");
+
+        let zip_file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        zip_writer.add_directory("subdir/", zip::write::FileOptions::<()>::default()).unwrap();
+        zip_writer.start_file("subdir/foo.txt", zip::write::FileOptions::<()>::default()).unwrap();
+        zip_writer.write_all(b"nested").unwrap();
+        zip_writer.finish().unwrap();
+
+        let dest = dir.path().join("extracted");
+        extract_zip(&zip_path, &dest).unwrap();
+
+        assert!(dest.join("subdir/foo.txt").exists());
+    }
+
+    #[test]
+    fn is_dotnet_desktop_installed_checks_marker() {
+        let dir = tempdir().unwrap();
+        assert!(!is_dotnet_desktop_installed(dir.path()));
+        std::fs::write(dir.path().join(".dotnet_desktop_installed"), "installed").unwrap();
+        assert!(is_dotnet_desktop_installed(dir.path()));
+    }
+
+    #[test]
+    fn setup_tool_propagates_fetch_errors() {
+        let tool = ToolEntry {
+            name: "Test".into(),
+            slug: "test".into(),
+            github_repo: "user/nonexistent-repo".into(),
+            description: "".into(),
+        };
+        let prefix = tempdir().unwrap();
+        let result = setup_tool(&tool, prefix.path());
+        assert!(result.is_err());
+    }
 }
 
 /// Install .NET Desktop Runtime into the Proton prefix using winetricks.

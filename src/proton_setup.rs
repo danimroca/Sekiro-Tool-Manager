@@ -425,10 +425,61 @@ pub fn open_proton_directory() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_proton_compatibility_dir() {
         let dir = proton_compatibility_dir();
         assert!(dir.to_string_lossy().contains(".steam/steam/compatibilitytools.d"));
+    }
+
+    #[test]
+    fn verify_checksum_passes_on_match() {
+        let dir = tempdir().unwrap();
+        let data = b"hello world";
+        let tarball = dir.path().join("test.tar.gz");
+        std::fs::write(&tarball, data).unwrap();
+
+        let expected = {
+            let mut hasher = Sha512::new();
+            std::io::copy(&mut std::io::Cursor::new(data), &mut hasher).unwrap();
+            format!("{:x}  test.tar.gz", hasher.finalize())
+        };
+        let checksum = dir.path().join("test.sha512sum");
+        std::fs::write(&checksum, &expected).unwrap();
+
+        assert!(verify_checksum(&tarball, &checksum).is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_fails_on_mismatch() {
+        let dir = tempdir().unwrap();
+        let tarball = dir.path().join("test.tar.gz");
+        std::fs::write(&tarball, b"real data").unwrap();
+
+        let checksum = dir.path().join("test.sha512sum");
+        std::fs::write(&checksum, "deadbeef  test.tar.gz\n").unwrap();
+
+        assert!(verify_checksum(&tarball, &checksum).is_err());
+    }
+
+    #[test]
+    fn verify_proton_installation_detects_proton_binary() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("proton"), "").unwrap();
+        assert!(verify_proton_installation(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn verify_proton_installation_detects_protontricks_binary() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("protontricks"), "").unwrap();
+        assert!(verify_proton_installation(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn verify_proton_installation_fails_on_missing_binary() {
+        let dir = tempdir().unwrap();
+        assert!(verify_proton_installation(dir.path()).is_err());
     }
 }

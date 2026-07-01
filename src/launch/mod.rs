@@ -419,11 +419,12 @@ fn parse_manifest_install_dir(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("\"installdir\"") {
-            // Extract the value between quotes after "installdir"
-            if let Some(start) = trimmed.find('"') {
-                let rest = &trimmed[start + 1..];
-                if let Some(end) = rest.find('"') {
-                    return Some(rest[..end].to_string());
+            // Split by '"' to find the value after "installdir"
+            // Format: "installdir" "value" — we want parts[3]
+            let parts: Vec<&str> = trimmed.split('"').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if *part == "installdir" {
+                    return parts.get(i + 2).map(|s| s.to_string());
                 }
             }
         }
@@ -642,4 +643,100 @@ pub fn launch_tools(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_proton_path_parses_ge_proton() {
+        let cmdline = "/some/path/GE-Proton10-26/proton\0--other\0args\0";
+        let result = extract_proton_path(cmdline);
+        assert!(result.is_some());
+        // Returns the grandparent of "proton" (i.e. the directory containing GE-Proton)
+        let path = result.unwrap();
+        assert_eq!(path, PathBuf::from("/some/path"));
+    }
+
+    #[test]
+    fn extract_proton_path_returns_none_for_unrelated() {
+        let cmdline = "/usr/bin/python\0script.py\0";
+        let result = extract_proton_path(cmdline);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_proton_path_handles_empty_cmdline() {
+        assert!(extract_proton_path("").is_none());
+    }
+
+    #[test]
+    fn has_wine_binary_finds_files_bin_wine() {
+        let dir = tempfile::tempdir().unwrap();
+        let wine_path = dir.path().join("files/bin/wine");
+        std::fs::create_dir_all(wine_path.parent().unwrap()).unwrap();
+        std::fs::write(&wine_path, "").unwrap();
+        assert!(has_wine_binary(dir.path()));
+    }
+
+    #[test]
+    fn has_wine_binary_finds_dist_bin_wine() {
+        let dir = tempfile::tempdir().unwrap();
+        let wine_path = dir.path().join("dist/bin/wine");
+        std::fs::create_dir_all(wine_path.parent().unwrap()).unwrap();
+        std::fs::write(&wine_path, "").unwrap();
+        assert!(has_wine_binary(dir.path()));
+    }
+
+    #[test]
+    fn has_wine_binary_returns_false_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_wine_binary(dir.path()));
+    }
+
+    #[test]
+    fn wine_binary_path_prefers_files_over_dist() {
+        let dir = tempfile::tempdir().unwrap();
+        let files_path = dir.path().join("files/bin/wine");
+        let dist_path = dir.path().join("dist/bin/wine");
+        std::fs::create_dir_all(files_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dist_path.parent().unwrap()).unwrap();
+        std::fs::write(&files_path, "").unwrap();
+        std::fs::write(&dist_path, "").unwrap();
+        assert_eq!(wine_binary_path(dir.path()), files_path);
+    }
+
+    #[test]
+    fn wine_binary_path_falls_back_to_dist() {
+        let dir = tempfile::tempdir().unwrap();
+        let dist_path = dir.path().join("dist/bin/wine");
+        std::fs::create_dir_all(dist_path.parent().unwrap()).unwrap();
+        std::fs::write(&dist_path, "").unwrap();
+        assert_eq!(wine_binary_path(dir.path()), dist_path);
+    }
+
+    #[test]
+    fn parse_manifest_install_dir_extracts_value() {
+        // Steam uses tab between key and value
+        let content = r#"
+"appid"		"814380"
+"installdir"		"Sekiro Sekiro Shadows Die Again"
+"SizeOnDisk"		"12345678"
+"StateFlags"		"4"
+"#;
+        assert_eq!(
+            parse_manifest_install_dir(content),
+            Some("Sekiro Sekiro Shadows Die Again".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_manifest_install_dir_returns_none_when_missing() {
+        let content = r#"
+"appid" "814380"
+"SizeOnDisk" "12345678"
+"#;
+        assert_eq!(parse_manifest_install_dir(content), None);
+    }
 }
