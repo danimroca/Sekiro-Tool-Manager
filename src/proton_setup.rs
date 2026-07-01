@@ -386,16 +386,8 @@ pub fn open_tools_directory(game_prefix: &Path) -> Result<(), String> {
     fs::create_dir_all(&tools_dir)
         .map_err(|e| format!("Failed to create tools directory: {e}"))?;
 
-    let output = Command::new("xdg-open")
-        .arg(&tools_dir)
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(format!(
-            "Failed to open tools directory: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )),
+    match Command::new("xdg-open").arg(&tools_dir).spawn() {
+        Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             Err(format!("Failed to open file explorer: xdg-open not found. Please navigate to {}/drive_c/tools manually", game_prefix.display()))
         }

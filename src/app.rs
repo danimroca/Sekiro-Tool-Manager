@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
@@ -6,7 +7,8 @@ use std::time::Duration;
 
 use iced::widget::{button, column, container, pick_list, row, text};
 use iced::{stream, window, Border, Color, Element, Length, Subscription, Task};
-use iced::futures::SinkExt;
+use iced::advanced::subscription::{EventStream, Hasher, Recipe, from_recipe};
+use iced::futures::{SinkExt, StreamExt};
 
 use crate::config::Config;
 use crate::manifest::{Manifest, ToolEntry};
@@ -17,50 +19,15 @@ use crate::tray;
 use crate::ui;
 use crate::ui::tool_card::ToolStatus;
 
-/// Wrapper so the tray receiver can be used as a `Subscription` identity
-/// (it must be `Hash`, which `Mutex` is not).
-struct ProtonProgressWatcher(Arc<Mutex<Option<tokio::sync::watch::Receiver<(String, f32)>>>>);
-
-impl std::hash::Hash for ProtonProgressWatcher {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        1usize.hash(state);
-    }
-}
-
-impl Clone for ProtonProgressWatcher {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-struct TrayListener(Arc<Mutex<Option<mpsc::Receiver<tray::TrayMessage>>>>);
-
-impl std::hash::Hash for TrayListener {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Fixed identity — there's only one tray listener at a time
-        0usize.hash(state);
-    }
-}
-
-impl Clone for TrayListener {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
 
 
 pub fn run() -> iced::Result {
-    iced::application(
+    iced::daemon(
         State::boot,
         update,
         view,
     )
     .subscription(subscription)
-    .window(iced::window::Settings {
-        exit_on_close_request: false,
-        ..Default::default()
-    })
     .run()
 }
 
@@ -87,6 +54,7 @@ pub struct State {
 
     // Settings screen
     settings_active: bool,
+    suggested_game_dir: Option<PathBuf>,
 
     // Game launch tracking
     game_launched: bool,
@@ -136,6 +104,10 @@ pub enum Message {
     GamePrefixSettingsChosen(PathBuf),
     ProtonSettingsSelect,
     ProtonSettingsChosen(PathBuf),
+    GameDirFound(PathBuf),
+    GameDirFoundAccept,
+    GameDirFoundReject,
+    NoOp,
     // Tray / window events
     CloseRequested,
     TrayShowRequested,
@@ -168,33 +140,44 @@ impl State {
             tool_statuses.insert(tool.slug.clone(), ToolStatus::Checking);
         }
 
+        let state = State {
+            manifest: Some(builtin),
+            config: Config::default(),
+            proton_path: None,
+            game_prefix_path: None,
+            log_messages: Vec::new(),
+            log_visible: false,
+
+            proton_setup_active: false,
+            proton_setup_progress: None,
+            proton_watch_rx: Arc::new(Mutex::new(None)),
+
+            tool_statuses,
+
+            setup_active: false,
+            setup_progress: Vec::new(),
+            setup_cancelled: Arc::new(AtomicBool::new(false)),
+
+            game_launched: false,
+            settings_active: false,
+            suggested_game_dir: None,
+
+            tray_rx,
+
+            main_window_id: None,
+        };
+
+        // Daemon starts with no windows — open one
+        let (_, open_task) = iced::window::open(iced::window::Settings {
+            exit_on_close_request: false,
+            position: iced::window::Position::Centered,
+            ..Default::default()
+        });
+
         (
-            State {
-                manifest: Some(builtin),
-                config: Config::default(),
-                proton_path: None,
-                game_prefix_path: None,
-                log_messages: Vec::new(),
-                log_visible: false,
-
-                proton_setup_active: false,
-                proton_setup_progress: None,
-                proton_watch_rx: Arc::new(Mutex::new(None)),
-
-                tool_statuses,
-
-                setup_active: false,
-                setup_progress: Vec::new(),
-                setup_cancelled: Arc::new(AtomicBool::new(false)),
-
-                game_launched: false,
-                settings_active: false,
-
-                tray_rx,
-
-                main_window_id: None,
-            },
+            state,
             Task::batch([
+                open_task.map(Message::WindowOpened),
                 Task::perform(config_future, |res| {
                     match res {
                         Ok(Ok(config)) => Message::ConfigLoaded(Ok(config)),
@@ -279,9 +262,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.proton_setup_active = true;
             }
 
-            // If no game directories configured, show Settings screen
+            // If no game directories configured, show Settings screen and suggest detection
             if state.config.game_directories.is_empty() {
                 state.settings_active = true;
+            }
+            if state.config.game_directories.is_empty() && state.suggested_game_dir.is_none() {
+                return Task::perform(
+                    tokio::task::spawn_blocking(crate::launch::find_sekiro_game_dir),
+                    |result| match result {
+                        Ok(Some(path)) => Message::GameDirFound(path),
+                        _ => Message::LogPush("No Sekiro installation found automatically.".into()),
+                    },
+                );
             }
 
             // If manifest is already loaded, spawn per-tool verification checks
@@ -306,13 +298,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.config.game_directories.is_empty() {
                 state.settings_active = true;
             }
+            if state.config.game_directories.is_empty() && state.suggested_game_dir.is_none() {
+                return Task::perform(
+                    tokio::task::spawn_blocking(crate::launch::find_sekiro_game_dir),
+                    |result| match result {
+                        Ok(Some(path)) => Message::GameDirFound(path),
+                        _ => Message::LogPush("No Sekiro installation found automatically.".into()),
+                    },
+                );
+            }
             Task::none()
         }
         Message::ProtonPathSelected(path) => {
             state.proton_path = Some(path.clone());
             state.config.proton.path = Some(path.to_string_lossy().to_string());
-            let _ = state.config.save();
-            Task::none()
+            save_config_background(state.config.clone())
         }
         Message::ProtonDownload => {
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -368,9 +368,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         // Save the path
                         state.proton_path = Some(path.clone());
                         state.config.proton.path = Some(path.to_string_lossy().to_string());
-                        let _ = state.config.save();
                         state.log_messages.push("Proton has been set up successfully!".to_string());
                         state.log_visible = true;
+                        return save_config_background(state.config.clone());
                     }
                 }
                 Err(e) => {
@@ -431,16 +431,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.proton_setup_active = false;
                     state.proton_path = Some(path.clone());
                     state.config.proton.path = Some(path.to_string_lossy().to_string());
-                    let _ = state.config.save();
                     state.log_messages.push("Proton path set successfully!".to_string());
                     state.log_visible = true;
+                    save_config_background(state.config.clone())
                 }
                 Err(e) => {
                     state.log_messages.push(format!("Invalid Proton installation: {e}"));
                     state.log_visible = true;
+                    Task::none()
                 }
             }
-            Task::none()
         }
         Message::GamePrefixSelect => {
             // Show a directory chooser dialog for the game prefix
@@ -464,12 +464,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if path.is_dir() {
                 state.game_prefix_path = Some(path.clone());
                 state.config.game_prefix.path = Some(path.to_string_lossy().to_string());
-                let _ = state.config.save();
                 state.log_messages.push("Game prefix set successfully!".to_string());
                 state.log_visible = true;
-            } else {
-                state.log_messages.push("Selected path is not a directory.".to_string());
-                state.log_visible = true;
+                return save_config_background(state.config.clone());
             }
             Task::none()
         }
@@ -751,13 +748,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::GameDirectoryAddName(name, path) => {
             state.config.game_directories.add(name, path);
-            let _ = state.config.save();
-            Task::none()
+            save_config_background(state.config.clone())
         }
         Message::GameDirectoryRemove(name) => {
             state.config.game_directories.remove(&name);
-            let _ = state.config.save();
-            Task::none()
+            save_config_background(state.config.clone())
         }
         Message::GameDirectoryRenameOld(name) => {
             let old_name = name.clone();
@@ -781,13 +776,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let new_name = new_name.trim().to_string();
             if !new_name.is_empty() && new_name != old_name {
                 state.config.game_directories.rename(&old_name, &new_name);
-                let _ = state.config.save();
+                return save_config_background(state.config.clone());
             }
             Task::none()
         }
         Message::GameDirectorySelect(name) => {
             state.config.game_directories.selected = Some(name);
-            let _ = state.config.save();
+            save_config_background(state.config.clone())
+        }
+        Message::GameDirFound(path) => {
+            state.suggested_game_dir = Some(path);
+            Task::none()
+        }
+        Message::GameDirFoundAccept => {
+            if let Some(path) = state.suggested_game_dir.take() {
+                let name = path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                state.config.game_directories.add(name, path);
+                state.settings_active = false;
+                return save_config_background(state.config.clone());
+            }
+            Task::none()
+        }
+        Message::GameDirFoundReject => {
+            state.suggested_game_dir = None;
             Task::none()
         }
         Message::GamePrefixSettingsSelect => {
@@ -811,9 +825,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if path.is_dir() {
                 state.game_prefix_path = Some(path.clone());
                 state.config.game_prefix.path = Some(path.to_string_lossy().to_string());
-                let _ = state.config.save();
                 state.log_messages.push("Game prefix set successfully!".to_string());
                 state.log_visible = true;
+                return save_config_background(state.config.clone());
             }
             Task::none()
         }
@@ -839,16 +853,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 Ok(()) => {
                     state.proton_path = Some(path.clone());
                     state.config.proton.path = Some(path.to_string_lossy().to_string());
-                    let _ = state.config.save();
                     state.log_messages.push("Proton path set successfully!".to_string());
                     state.log_visible = true;
+                    save_config_background(state.config.clone())
                 }
                 Err(e) => {
                     state.log_messages.push(format!("Invalid Proton installation: {e}"));
                     state.log_visible = true;
+                    Task::none()
                 }
             }
-            Task::none()
         }
         Message::ToolStatusChecked { slug, installed } => {
             let status = if installed {
@@ -865,8 +879,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 state.config.tools.selected.push(slug);
             }
-            let _ = state.config.save();
-            Task::none()
+            save_config_background(state.config.clone())
         }
         Message::LogToggle => {
             state.log_visible = !state.log_visible;
@@ -881,6 +894,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.log_visible = false;
             Task::none()
         }
+        Message::NoOp => Task::none(),
         Message::SetupDone(results) => {
             state.setup_active = false;
             state.setup_progress = results.clone();
@@ -918,22 +932,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::CloseRequested => {
-            // Hide to tray instead of closing
+            // Close the window — the Daemon keeps the event loop alive
+            // so the tray icon stays responsive. Tray "Show" reopens it.
             log::info!("Close requested — hiding to tray");
-            if let Some(id) = state.main_window_id {
-                window::set_mode(id, window::Mode::Hidden)
+            if let Some(id) = state.main_window_id.take() {
+                window::close(id)
             } else {
                 Task::none()
             }
         }
         Message::TrayShowRequested => {
-            // Restore window from tray
+            // Reopen the window
             log::info!("Tray: show launcher requested");
-            if let Some(id) = state.main_window_id {
-                window::set_mode(id, window::Mode::Windowed)
-            } else {
-                Task::none()
-            }
+            let (_, task) = window::open(iced::window::Settings {
+                exit_on_close_request: false,
+                position: iced::window::Position::Centered,
+                ..Default::default()
+            });
+            task.map(Message::WindowOpened)
         }
         Message::TrayLaunchGame => {
             // Launch just Sekiro (no tools) — mirrors Launch button logic
@@ -1134,7 +1150,7 @@ async fn run_setup(
     results
 }
 
-fn view(state: &State) -> Element<'_, Message> {
+fn view(state: &State, _window: window::Id) -> Element<'_, Message> {
     // If proton setup is active, show the proton setup screen
     if state.proton_setup_active {
         return view_proton_setup(state);
@@ -1465,12 +1481,24 @@ fn view_settings(state: &State) -> Element<'_, Message> {
             })
     };
 
+    let button_row = row![
+        back_button,
+        iced::widget::Space::new().width(Length::Fill),
+        button(text("Tools Directory"))
+            .padding(10)
+            .on_press(Message::ToolsDirectory)
+            .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+                button_primary_style(status)
+            }),
+    ]
+    .spacing(10);
+
     let content = column![
         title_row,
         prefix_card,
         dir_card,
         proton_card,
-        back_button,
+        button_row,
     ]
     .spacing(16)
     .padding(24);
@@ -1483,7 +1511,72 @@ fn view_settings(state: &State) -> Element<'_, Message> {
             ..iced::widget::container::Style::default()
         });
 
-    base.into()
+    if let Some(path) = &state.suggested_game_dir {
+        let suggestion_dialog = container(
+            column![
+                text("Sekiro Installation Found")
+                    .size(16)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::FG),
+                    }),
+                text(format!("Found Sekiro at:\n{}", path.display()))
+                    .size(13)
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::MUTED),
+                    }),
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("No"))
+                        .padding([8, 16])
+                        .on_press(Message::GameDirFoundReject)
+                        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+                            button_secondary_style(status)
+                        }),
+                    button(text("Yes"))
+                        .padding([8, 16])
+                        .on_press(Message::GameDirFoundAccept)
+                        .style(|_: &iced::Theme, status: iced::widget::button::Status| {
+                            button_primary_style(status)
+                        }),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16)
+            .padding(20),
+        )
+        .width(380)
+        .style(|_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::SURFACE)),
+            border: Border {
+                color: Color::from_rgb(0.2, 0.2, 0.25),
+                radius: 10.0.into(),
+                width: 1.0,
+            },
+            ..iced::widget::container::Style::default()
+        });
+
+        container(
+            row![
+                iced::widget::Space::new().width(Length::Fill),
+                column![
+                    iced::widget::Space::new().height(Length::Fill),
+                    suggestion_dialog,
+                    iced::widget::Space::new().height(Length::Fill),
+                ]
+                .width(380),
+                iced::widget::Space::new().width(Length::Fill),
+            ]
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+    } else {
+        base.into()
+    }
 }
 
 /// View for the proton setup screen.
@@ -1623,6 +1716,59 @@ fn button_custom_style(status: iced::widget::button::Status) -> iced::widget::bu
     }
 }
 
+/// Save config to disk in the background to avoid blocking the UI thread.
+fn save_config_background(config: Config) -> Task<Message> {
+    Task::perform(
+        tokio::task::spawn_blocking(move || {
+            let _ = config.save();
+        }),
+        |_| Message::NoOp,
+    )
+}
+
+/// A [`Recipe`] that wraps a stream and drains the event stream to prevent
+/// the subscription tracker's broadcast channel from overflowing.
+///
+/// Subscriptions created with `Subscription::run_with` / `run_with_id` do
+/// not consume from their event stream, causing `iced_futures::subscription::tracker`
+/// to emit `TrySendError { kind: Full }` warnings when shell events accumulate
+/// in the channel buffer. This recipe merges the event stream (discarding
+/// events) with the actual stream so the buffer is drained.
+struct DrainingRunner<F> {
+    id: u64,
+    builder: Option<F>,
+}
+
+impl<F> Recipe for DrainingRunner<F>
+where
+    F: FnOnce() -> iced::futures::stream::BoxStream<'static, Message> + Send + 'static,
+{
+    type Output = Message;
+
+    fn hash(&self, state: &mut Hasher) {
+        Hash::hash(&self.id, state);
+    }
+
+    fn stream(self: Box<Self>, input: EventStream) -> iced::futures::stream::BoxStream<'static, Self::Output> {
+        let main = (self.builder.unwrap())();
+        let drain = input.filter_map(|_| async { None::<Message> });
+        iced::futures::stream::select(main, drain).boxed()
+    }
+}
+
+/// Creates a [`Subscription`] whose stream is the output of `builder`, while
+/// also draining the event stream (discarding events) to prevent channel
+/// overflow in the subscription tracker.
+fn draining_subscription<F>(id: u64, builder: F) -> Subscription<Message>
+where
+    F: FnOnce() -> iced::futures::stream::BoxStream<'static, Message> + Send + 'static,
+{
+    from_recipe(DrainingRunner {
+        id,
+        builder: Some(builder),
+    })
+}
+
 fn setup_button() -> iced::widget::Button<'static, Message> {
     button(text("Setup"))
         .padding(10)
@@ -1746,79 +1892,69 @@ fn subscription(state: &State) -> Subscription<Message> {
     let close_events = window::close_requests().map(|_| Message::CloseRequested);
 
     // 2. Tray event stream
-    let listener = TrayListener(state.tray_rx.clone());
-    let tray_events = Subscription::run_with(listener, |data: &TrayListener| {
-        let rx = data.0.clone();
-        stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
-            let rx = rx.clone();
-            async move {
-                // Scope the MutexGuard so it's dropped before any .await
-                let receiver = {
-                    let mut guard = rx.lock().unwrap();
-                    match guard.take() {
-                        Some(r) => r,
-                        None => return, // already consumed
-                    }
-                };
+    let tray_rx = state.tray_rx.clone();
+    let tray_events = draining_subscription(0, move || {
+        let rx = tray_rx.clone();
+        Box::pin(stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let receiver = {
+                let mut guard = rx.lock().unwrap();
+                match guard.take() {
+                    Some(r) => r,
+                    None => return,
+                }
+            };
 
-                loop {
-                    match receiver.try_recv() {
-                        Ok(tray::TrayMessage::Show) => {
-                            let _ = output.send(Message::TrayShowRequested).await;
-                        }
-                        Ok(tray::TrayMessage::LaunchGame) => {
-                            let _ = output.send(Message::TrayLaunchGame).await;
-                        }
-                        Ok(tray::TrayMessage::LaunchAll) => {
-                            let _ = output.send(Message::TrayLaunchAll).await;
-                        }
-                        Ok(tray::TrayMessage::Quit) => {
-                            let _ = output.send(Message::TrayQuitRequested).await;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => break,
+            loop {
+                match receiver.try_recv() {
+                    Ok(tray::TrayMessage::Show) => {
+                        let _ = output.send(Message::TrayShowRequested).await;
                     }
+                    Ok(tray::TrayMessage::LaunchGame) => {
+                        let _ = output.send(Message::TrayLaunchGame).await;
+                    }
+                    Ok(tray::TrayMessage::LaunchAll) => {
+                        let _ = output.send(Message::TrayLaunchAll).await;
+                    }
+                    Ok(tray::TrayMessage::Quit) => {
+                        let _ = output.send(Message::TrayQuitRequested).await;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
             }
-        })
+        }))
     });
 
     // 3. Proton download progress watcher — polls the watch channel in a loop
-    let watcher = ProtonProgressWatcher(state.proton_watch_rx.clone());
-    let progress_events = Subscription::run_with(watcher, |data: &ProtonProgressWatcher| {
-        let rx = data.0.clone();
-        stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
-            let rx = rx.clone();
-            async move {
-                loop {
-                    // Wait until a receiver is available (user clicked Download)
-                    let mut receiver = loop {
-                        let opt = rx.lock().unwrap().clone();
-                        if let Some(r) = opt {
-                            break r;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    };
+    let watch_rx = state.proton_watch_rx.clone();
+    let progress_events = draining_subscription(1, move || {
+        let rx = watch_rx.clone();
+        Box::pin(stream::channel(32, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            loop {
+                let mut receiver = loop {
+                    let opt = rx.lock().unwrap().clone();
+                    if let Some(r) = opt {
+                        break r;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                };
 
-                    // Process progress updates from this download
-                    loop {
-                        match receiver.changed().await {
-                            Ok(()) => {
-                                let (msg, progress) = receiver.borrow_and_update().clone();
-                                let _ = output.send(Message::ProtonDownloadProgress(msg, progress)).await;
-                            }
-                            Err(_) => {
-                                // Sender dropped — download finished or failed
-                                rx.lock().unwrap().take();
-                                break;
-                            }
+                loop {
+                    match receiver.changed().await {
+                        Ok(()) => {
+                            let (msg, progress) = receiver.borrow_and_update().clone();
+                            let _ = output.send(Message::ProtonDownloadProgress(msg, progress)).await;
+                        }
+                        Err(_) => {
+                            rx.lock().unwrap().take();
+                            break;
                         }
                     }
                 }
             }
-        })
+        }))
     });
 
     // 4. Window open events — capture the main window ID
